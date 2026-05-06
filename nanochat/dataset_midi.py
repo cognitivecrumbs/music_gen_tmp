@@ -14,7 +14,7 @@ import requests
 import pyarrow.parquet as pq
 
 from multiprocessing import Pool
-from midi_utils import *
+# from midi_utils import *
 from huggingface_hub import HfFileSystem
 from nanochat.common import get_base_dir
 
@@ -38,39 +38,39 @@ MAX_SHARD = min(MAX_SHARD, len(fname_list)-1)
 # -----------------------------------------------------------------------------
 # These functions are useful utilities to other modules, can/should be imported
 
-def get_midi_string(split, start=0, step=1):
-    assert split in ["train", "val"], "split must be 'train' or 'val'"
+# def get_midi_string(split, start=0, step=1):
+#     assert split in ["train", "val"], "split must be 'train' or 'val'"
 
-    fname_list = os.listdir(DATA_DIR)
-    for fname in fname_list:
-        midi_path_dir = 'tmp_data'
-        midi_path = 'albeniz-aragon_fantasia_op47_part_6.mid'
-        midi_path = os.path.join(midi_path_dir,fname)
+#     fname_list = os.listdir(DATA_DIR)
+#     for fname in fname_list:
+#         midi_path_dir = 'tmp_data'
+#         midi_path = 'albeniz-aragon_fantasia_op47_part_6.mid'
+#         midi_path = os.path.join(midi_path_dir,fname)
 
-        # Load the MIDI file
-        imported_midi = import_midi(midi_path,midi_processor_highest_pitch_track)
-        imported_midi = imported_midi.astype(float)
-        imported_midi = imported_midi[:,:3]
+#         # Load the MIDI file
+#         imported_midi = import_midi(midi_path,midi_processor_highest_pitch_track)
+#         imported_midi = imported_midi.astype(float)
+#         imported_midi = imported_midi[:,:3]
 
-        midi_notes = imported_midi
+#         midi_notes = imported_midi
 
-        # sort by time 
-        # sorted_inds = np.argsort(midi_notes[:,0])
-        sorted_inds = np.lexsort((midi_notes[:,0],midi_notes[:,1],midi_notes[:,2]))
-        midi_notes_sorted = midi_notes[sorted_inds,:]
+#         # sort by time 
+#         # sorted_inds = np.argsort(midi_notes[:,0])
+#         sorted_inds = np.lexsort((midi_notes[:,0],midi_notes[:,1],midi_notes[:,2]))
+#         midi_notes_sorted = midi_notes[sorted_inds,:]
 
-        highest_notes = midi_notes_sorted
+#         highest_notes = midi_notes_sorted
 
-        # get offset differences
-        highest_notes[1:,0] = highest_notes[1:,0] - highest_notes[:-1,0]
-        highest_notes[0,0] = 0
+#         # get offset differences
+#         highest_notes[1:,0] = highest_notes[1:,0] - highest_notes[:-1,0]
+#         highest_notes[0,0] = 0
 
-        sequence = 'BOS_None '
-        for val in imported_midi:
-            sequence += '%1.3f'%(val[0]) + '-' + '%1.3f'%(val[1]) + '-' + str(int(val[2])) + ' '
-        # sequence += ' [EOS]'
+#         sequence = 'BOS_None '
+#         for val in imported_midi:
+#             sequence += '%1.3f'%(val[0]) + '-' + '%1.3f'%(val[1]) + '-' + str(int(val[2])) + ' '
+#         # sequence += ' [EOS]'
 
-        yield sequence
+#         yield sequence
 
 # -----------------------------------------------------------------------------
 

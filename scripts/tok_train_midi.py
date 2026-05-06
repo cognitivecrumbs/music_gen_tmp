@@ -8,7 +8,7 @@ import argparse
 import torch
 from nanochat.tokenizer_midi import REMIBPETokenizer 
 from nanochat.common import get_base_dir
-from nanochat.dataset_midi import get_midi_string
+# from nanochat.dataset_midi import get_midi_string
 from pathlib import Path
 
 # -----------------------------------------------------------------------------
