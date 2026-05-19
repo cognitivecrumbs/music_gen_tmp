@@ -1,406 +1,449 @@
 """
-BPE Tokenizer in the style of GPT-4.
+nanochat/tokenizer.py  —  OctupleMIDI tokenizer (MusicBERT / Zeng et al. 2021)
+===============================================================================
+Each note is emitted as exactly 8 consecutive tokens, one per field:
+    (time_sig, tempo, bar, position, instrument, pitch, duration, velocity)
 
-Two implementations are available:
-1) HuggingFace Tokenizer that can do both training and inference but is really confusing
-2) Our own RustBPE Tokenizer for training and tiktoken for efficient inference
+Token IDs are drawn from non-overlapping ranges so OctupleEmbedding in gpt.py
+can identify each field by ID alone.
+
+Vocabulary (matches OCTOPLE_FIELD_VALS = [256]*8 in gpt.py):
+    [   0 ..  255]  TIME_SIG
+    [ 256 ..  511]  TEMPO
+    [ 512 ..  767]  BAR
+    [ 768 .. 1023]  POSITION
+    [1024 .. 1279]  INSTRUMENT
+    [1280 .. 1535]  PITCH
+    [1536 .. 1791]  DURATION
+    [1792 .. 2047]  VELOCITY
+    [2048]          EOS   ← single int, repeated 8 times to pad to note boundary
+    [2049]          PAD
+
+VOCAB_SIZE = 2050
+
+Inference note
+--------------
+engine.py generates ONE token at a time. For OctupleMIDI we need 8 tokens
+per note. The solution: engine.py already has a `forced_tokens` deque per row.
+After generating the first field of a note (TIME_SIG), we force-inject the
+remaining 7 fields. This is handled by a helper `note_fields_after_first()`
+which the sampling block in base_train.py / engine.py can call.
+
+In practice for nanomusic we skip tool-use and just generate greedily in
+groups of 8 — see generate_music_batch() below which wraps Engine cleanly.
 """
 
-import os
-import copy
-from functools import lru_cache
+from __future__ import annotations
+import math
+import struct
+from pathlib import Path
+from typing import List, Optional, Tuple, Union
 
-SPECIAL_TOKENS = [
-    # every document begins with the Beginning of Sequence (BOS) token that delimits documents
-    "<|bos|>",
-    # tokens below are only used during finetuning to render Conversations into token ids
-    "<|user_start|>", # user messages
-    "<|user_end|>",
-    "<|assistant_start|>", # assistant messages
-    "<|assistant_end|>",
-    "<|python_start|>", # assistant invokes python REPL tool
-    "<|python_end|>",
-    "<|output_start|>", # python REPL outputs back to assistant
-    "<|output_end|>",
+# ── Vocabulary ───────────────────────────────────────────────────────────────
+
+FIELD_SIZE   = 256
+NUM_FIELDS   = 8
+BASE_VOCAB   = FIELD_SIZE * NUM_FIELDS   # 2048
+BASE_VOCAB   = 256+2
+
+F_TIME_SIG   = 0*0 * FIELD_SIZE
+F_TEMPO      = 0*1 * FIELD_SIZE
+F_BAR        = 0*2 * FIELD_SIZE
+F_POSITION   = 0*3 * FIELD_SIZE
+F_INSTRUMENT = 0*4 * FIELD_SIZE
+F_PITCH      = 0*5 * FIELD_SIZE
+F_DURATION   = 0*6 * FIELD_SIZE
+F_VELOCITY   = 0*7 * FIELD_SIZE
+
+FIELD_OFFSETS = [
+    F_TIME_SIG, F_TEMPO, F_BAR, F_POSITION,
+    F_INSTRUMENT, F_PITCH, F_DURATION, F_VELOCITY,
 ]
 
-# NOTE: this split pattern deviates from GPT-4 in that we use \p{N}{1,2} instead of \p{N}{1,3}
-# I did this because I didn't want to "waste" too many tokens on numbers for smaller vocab sizes.
-# I verified that 2 is the sweet spot for vocab size of 32K. 1 is a bit worse, 3 was worse still.
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+# EOS is a SINGLE integer — the engine generates one token at a time.
+# We use BASE_VOCAB (2048) and pad notes to 8-token boundaries with it.
+EOS_TOKEN  = BASE_VOCAB       # 2048  ← int, not a list
+PAD_TOKEN  = BASE_VOCAB + 1   # 2049
+VOCAB_SIZE = BASE_VOCAB + 2   # 2050
+# EOS_TOKEN  = BASE_VOCAB       # 2048  ← int, not a list
 
-# -----------------------------------------------------------------------------
-# Generic GPT-4-style tokenizer based on HuggingFace Tokenizer
-from tokenizers import Tokenizer as HFTokenizer
-from tokenizers import pre_tokenizers, decoders, Regex
-from tokenizers.models import BPE
-from tokenizers.trainers import BpeTrainer
+EOS_TOKEN = FIELD_SIZE
+PAD_TOKEN = FIELD_SIZE + 1
 
-class HuggingFaceTokenizer:
-    """Light wrapper around HuggingFace Tokenizer for some utilities"""
+# 8-token EOS note: fills one complete note slot, signals end of sequence
+EOS_NOTE = [EOS_TOKEN] * NUM_FIELDS
 
-    def __init__(self, tokenizer):
-        self.tokenizer = tokenizer
 
-    @classmethod
-    def from_pretrained(cls, hf_path):
-        # init from a HuggingFace pretrained tokenizer (e.g. "gpt2")
-        tokenizer = HFTokenizer.from_pretrained(hf_path)
-        return cls(tokenizer)
+# ── Field encoders / decoders ────────────────────────────────────────────────
 
-    @classmethod
-    def from_directory(cls, tokenizer_dir):
-        # init from a local directory on disk (e.g. "out/tokenizer")
-        tokenizer_path = os.path.join(tokenizer_dir, "tokenizer.json")
-        tokenizer = HFTokenizer.from_file(tokenizer_path)
-        return cls(tokenizer)
+_TIME_SIGS = [
+    (4,4),(3,4),(2,4),(6,8),(12,8),(2,2),(3,8),(5,4),
+    (7,8),(6,4),(9,8),(5,8),(7,4),(11,8),(3,2),(1,4),
+]
+_TS_TO_IDX = {ts: i for i, ts in enumerate(_TIME_SIGS)}
 
-    @classmethod
-    def train_from_iterator(cls, text_iterator, vocab_size):
-        # train from an iterator of text
-        # Configure the HuggingFace Tokenizer
-        tokenizer = HFTokenizer(BPE(
-            byte_fallback=True, # needed!
-            unk_token=None,
-            fuse_unk=False,
-        ))
-        # Normalizer: None
-        tokenizer.normalizer = None
-        # Pre-tokenizer: GPT-4 style
-        # the regex pattern used by GPT-4 to split text into groups before BPE
-        # NOTE: The pattern was changed from \p{N}{1,3} to \p{N}{1,2} because I suspect it is harmful to
-        # very small models and smaller vocab sizes, because it is a little bit wasteful in the token space.
-        # (but I haven't validated this! TODO)
-        gpt4_split_regex = Regex(SPLIT_PATTERN) # huggingface demands that you wrap it in Regex!!
-        tokenizer.pre_tokenizer = pre_tokenizers.Sequence([
-            pre_tokenizers.Split(pattern=gpt4_split_regex, behavior="isolated", invert=False),
-            pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
-        ])
-        # Decoder: ByteLevel (it pairs together with the ByteLevel pre-tokenizer)
-        tokenizer.decoder = decoders.ByteLevel()
-        # Post-processor: None
-        tokenizer.post_processor = None
-        # Trainer: BPE
-        trainer = BpeTrainer(
-            vocab_size=vocab_size,
-            show_progress=True,
-            min_frequency=0, # no minimum frequency
-            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
-            special_tokens=SPECIAL_TOKENS,
-        )
-        # Kick off the training
-        tokenizer.train_from_iterator(text_iterator, trainer)
-        return cls(tokenizer)
+def encode_time_sig(num: int, denom: int) -> int:
+    return F_TIME_SIG + _TS_TO_IDX.get((num, denom), 0)
 
-    def get_vocab_size(self):
-        return self.tokenizer.get_vocab_size()
+def decode_time_sig(tok: int) -> Tuple[int, int]:
+    idx = tok - F_TIME_SIG
+    return _TIME_SIGS[idx] if 0 <= idx < len(_TIME_SIGS) else (4, 4)
 
-    def get_special_tokens(self):
-        special_tokens_map = self.tokenizer.get_added_tokens_decoder()
-        special_tokens = [w.content for w in special_tokens_map.values()]
-        return special_tokens
+_TEMPO_MIN, _TEMPO_MAX = 32.0, 240.0
 
-    def id_to_token(self, id):
-        return self.tokenizer.id_to_token(id)
+def encode_tempo(bpm: float) -> int:
+    bpm = max(_TEMPO_MIN, min(_TEMPO_MAX, bpm))
+    ratio = math.log(bpm / _TEMPO_MIN) / math.log(_TEMPO_MAX / _TEMPO_MIN)
+    return F_TEMPO + int(ratio * (FIELD_SIZE - 1))
 
-    def _encode_one(self, text, prepend=None, append=None, num_threads=None):
-        # encode a single string
-        # prepend/append can be either a string of a special token or a token id directly.
-        # num_threads is ignored (only used by the nanochat Tokenizer for parallel encoding)
-        assert isinstance(text, str)
-        ids = []
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.encode_special(prepend)
-            ids.append(prepend_id)
-        ids.extend(self.tokenizer.encode(text, add_special_tokens=False).ids)
-        if append is not None:
-            append_id = append if isinstance(append, int) else self.encode_special(append)
-            ids.append(append_id)
-        return ids
+def decode_tempo(tok: int) -> float:
+    ratio = (tok - F_TEMPO) / (FIELD_SIZE - 1)
+    return _TEMPO_MIN * (_TEMPO_MAX / _TEMPO_MIN) ** ratio
 
-    def encode_special(self, text):
-        # encode a single special token via exact match
-        return self.tokenizer.token_to_id(text)
+def encode_bar(bar_idx: int) -> int:
+    return F_BAR + (bar_idx % FIELD_SIZE)
 
-    def get_bos_token_id(self):
-        # Different HuggingFace models use different BOS tokens and there is little consistency
-        # 1) attempt to find a <|bos|> token
-        bos = self.encode_special("<|bos|>")
-        # 2) if that fails, attempt to find a <|endoftext|> token (e.g. GPT-2 models)
-        if bos is None:
-            bos = self.encode_special("<|endoftext|>")
-        # 3) if these fail, it's better to crash than to silently return None
-        assert bos is not None, "Failed to find BOS token in tokenizer"
-        return bos
+def decode_bar(tok: int) -> int:
+    return tok - F_BAR
 
-    def encode(self, text, *args, **kwargs):
-        if isinstance(text, str):
-            return self._encode_one(text, *args, **kwargs)
-        elif isinstance(text, list):
-            return [self._encode_one(t, *args, **kwargs) for t in text]
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
+def encode_position(pos_64ths: int) -> int:
+    return F_POSITION + min(pos_64ths, FIELD_SIZE - 1)
 
-    def __call__(self, *args, **kwargs):
-        return self.encode(*args, **kwargs)
+def decode_position(tok: int) -> int:
+    return tok - F_POSITION
 
-    def decode(self, ids):
-        return self.tokenizer.decode(ids, skip_special_tokens=False)
+def encode_instrument(program: int, is_drum: bool = False) -> int:
+    idx = 128 if is_drum else min(program, 127)
+    return F_INSTRUMENT + idx
 
-    def save(self, tokenizer_dir):
-        # save the tokenizer to disk
-        os.makedirs(tokenizer_dir, exist_ok=True)
-        tokenizer_path = os.path.join(tokenizer_dir, "tokenizer.json")
-        self.tokenizer.save(tokenizer_path)
-        print(f"Saved tokenizer to {tokenizer_path}")
+def decode_instrument(tok: int) -> Tuple[int, bool]:
+    idx = tok - F_INSTRUMENT
+    return (0, True) if idx == 128 else (idx, False)
 
-# -----------------------------------------------------------------------------
-# Tokenizer based on rustbpe + tiktoken combo
-import pickle
-import rustbpe
-import tiktoken
+def encode_pitch(pitch: int) -> int:
+    return F_PITCH + min(pitch, 128)   # 128 = rest
 
-class RustBPETokenizer:
-    """Light wrapper around tiktoken (for efficient inference) but train with rustbpe"""
+def decode_pitch(tok: int) -> int:
+    return tok - F_PITCH
 
-    def __init__(self, enc, bos_token):
-        self.enc = enc
-        self.bos_token_id = self.encode_special(bos_token)
+_DUR_MIN, _DUR_MAX = 10.0, 8000.0
 
-    @classmethod
-    def train_from_iterator(cls, text_iterator, vocab_size):
-        # 1) train using rustbpe
-        tokenizer = rustbpe.Tokenizer()
-        # the special tokens are inserted later in __init__, we don't train them here
-        vocab_size_no_special = vocab_size - len(SPECIAL_TOKENS)
-        assert vocab_size_no_special >= 256, f"vocab_size_no_special must be at least 256, got {vocab_size_no_special}"
-        tokenizer.train_from_iterator(text_iterator, vocab_size_no_special, pattern=SPLIT_PATTERN)
-        # 2) construct the associated tiktoken encoding for inference
-        pattern = tokenizer.get_pattern()
-        mergeable_ranks_list = tokenizer.get_mergeable_ranks()
-        mergeable_ranks = {bytes(k): v for k, v in mergeable_ranks_list}
-        tokens_offset = len(mergeable_ranks)
-        special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-        enc = tiktoken.Encoding(
-            name="rustbpe",
-            pat_str=pattern,
-            mergeable_ranks=mergeable_ranks, # dict[bytes, int] (token bytes -> merge priority rank)
-            special_tokens=special_tokens, # dict[str, int] (special token name -> token id)
-        )
-        return cls(enc, "<|bos|>")
+def encode_duration(ms: float) -> int:
+    ms = max(_DUR_MIN, min(_DUR_MAX, ms))
+    ratio = math.log(ms / _DUR_MIN) / math.log(_DUR_MAX / _DUR_MIN)
+    return F_DURATION + int(ratio * (FIELD_SIZE - 1))
 
-    @classmethod
-    def from_directory(cls, tokenizer_dir):
-        pickle_path = os.path.join(tokenizer_dir, "tokenizer.pkl")
-        with open(pickle_path, "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc, "<|bos|>")
+def decode_duration(tok: int) -> float:
+    ratio = (tok - F_DURATION) / (FIELD_SIZE - 1)
+    return _DUR_MIN * (_DUR_MAX / _DUR_MIN) ** ratio
 
-    @classmethod
-    def from_pretrained(cls, tiktoken_name):
-        # https://github.com/openai/tiktoken/blob/eedc8563/tiktoken_ext/openai_public.py
-        enc = tiktoken.get_encoding(tiktoken_name)
-        # tiktoken calls the special document delimiter token "<|endoftext|>"
-        # yes this is confusing because this token is almost always PREPENDED to the beginning of the document
-        # it most often is used to signal the start of a new sequence to the LLM during inference etc.
-        # so in nanoChat we always use "<|bos|>" short for "beginning of sequence", but historically it is often called "<|endoftext|>".
-        return cls(enc, "<|endoftext|>")
+def encode_velocity(vel: int) -> int:
+    return F_VELOCITY + min(vel, FIELD_SIZE - 1)
 
-    def get_vocab_size(self):
-        return self.enc.n_vocab
+def decode_velocity(tok: int) -> int:
+    return tok - F_VELOCITY
 
-    def get_special_tokens(self):
-        return self.enc.special_tokens_set
 
-    def id_to_token(self, id):
-        return self.enc.decode([id])
+# ── MIDI parser ───────────────────────────────────────────────────────────────
 
-    @lru_cache(maxsize=32)
-    def encode_special(self, text):
-        return self.enc.encode_single_token(text)
+def _read_varlen(data: bytes, pos: int) -> Tuple[int, int]:
+    value = 0
+    while True:
+        byte = data[pos]; pos += 1
+        value = (value << 7) | (byte & 0x7F)
+        if not (byte & 0x80):
+            break
+    return value, pos
 
-    def get_bos_token_id(self):
-        return self.bos_token_id
 
-    def encode(self, text, prepend=None, append=None, num_threads=8):
-        # text can be either a string or a list of strings
+def _parse_midi(path: str):
+    data = Path(path).read_bytes()
+    pos = 0
+    assert data[pos:pos+4] == b'MThd'
+    pos += 4
+    hdr_len        = struct.unpack('>I', data[pos:pos+4])[0]; pos += 4
+    pos += 2
+    n_tracks       = struct.unpack('>H', data[pos:pos+2])[0]; pos += 2
+    ticks_per_beat = struct.unpack('>H', data[pos:pos+2])[0]; pos += 2
+    pos += hdr_len - 6
 
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.encode_special(prepend)
-        if append is not None:
-            append_id = append if isinstance(append, int) else self.encode_special(append)
+    all_events = []
 
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id) # TODO: slightly inefficient here? :( hmm
-            if append is not None:
-                ids.append(append_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for ids_row in ids:
-                    ids_row.insert(0, prepend_id) # TODO: same
-            if append is not None:
-                for ids_row in ids:
-                    ids_row.append(append_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
+    for _ in range(n_tracks):
+        while pos < len(data) and data[pos:pos+4] != b'MTrk':
+            pos += 1
+        if pos >= len(data): break
+        pos += 4
+        track_len = struct.unpack('>I', data[pos:pos+4])[0]; pos += 4
+        track_end = pos + track_len
+        abs_tick = 0; rs = 0; program = [0] * 16
 
-        return ids
+        while pos < track_end:
+            delta, pos = _read_varlen(data, pos)
+            abs_tick  += delta
+            if pos >= track_end: break
+            byte = data[pos]
+            if byte == 0xFF:
+                pos += 1; mt = data[pos]; pos += 1
+                ml, pos = _read_varlen(data, pos)
+                if mt == 0x51 and ml == 3:
+                    t = struct.unpack('>I', b'\x00' + data[pos:pos+3])[0]
+                    all_events.append((abs_tick, 'tempo', 60_000_000 / t if t > 0 else 120.0))
+                elif mt == 0x58 and ml >= 2:
+                    all_events.append((abs_tick, 'timesig', data[pos], data[pos+1]))
+                pos += ml; continue
+            if byte in (0xF0, 0xF7):
+                pos += 1; sl, pos = _read_varlen(data, pos); pos += sl; continue
+            if byte & 0x80: rs = byte; pos += 1
+            ch = rs & 0x0F; mt2 = rs & 0xF0
+            if mt2 == 0xC0:
+                program[ch] = data[pos]; pos += 1
+            elif mt2 in (0x80, 0x90):
+                pitch = data[pos]; pos += 1; vel = data[pos]; pos += 1
+                on = (mt2 == 0x90 and vel > 0)
+                all_events.append((abs_tick, 'on' if on else 'off',
+                                   pitch, vel, program[ch], ch == 9, ch))
+            elif mt2 in (0xA0, 0xB0, 0xE0): pos += 2
+            elif mt2 in (0xC0, 0xD0):        pos += 1
+            else:                             pos += 1
+        pos = track_end
 
-    def __call__(self, *args, **kwargs):
-        return self.encode(*args, **kwargs)
+    all_events.sort(key=lambda e: e[0])
 
-    def decode(self, ids):
-        return self.enc.decode(ids)
+    open_notes = {}
+    notes = []
+    tempos    = [(0, 120.0)]
+    time_sigs = [(0, 4, 4)]
 
-    def save(self, tokenizer_dir):
-        # save the encoding object to disk
-        os.makedirs(tokenizer_dir, exist_ok=True)
-        pickle_path = os.path.join(tokenizer_dir, "tokenizer.pkl")
-        with open(pickle_path, "wb") as f:
-            pickle.dump(self.enc, f)
-        print(f"Saved tokenizer encoding to {pickle_path}")
+    for ev in all_events:
+        if ev[1] == 'tempo':
+            tempos.append((ev[0], ev[2]))
+        elif ev[1] == 'timesig':
+            time_sigs.append((ev[0], ev[2], 2 ** ev[3]))
+        elif ev[1] == 'on':
+            _, _, pitch, vel, prog, is_drum, ch = ev
+            open_notes[(pitch, ch)] = (ev[0], vel, prog, is_drum)
+        elif ev[1] == 'off':
+            _, _, pitch, vel, prog, is_drum, ch = ev
+            key = (pitch, ch)
+            if key in open_notes:
+                start, v2, p2, d2 = open_notes.pop(key)
+                dur = ev[0] - start
+                if dur > 0:
+                    notes.append((start, pitch, v2, dur, p2, d2))
 
-    def render_conversation(self, conversation, max_tokens=2048):
-        """
-        Tokenize a single Chat conversation (which we call a "doc" or "document" here).
-        Returns:
-        - ids: list[int] is a list of token ids of this rendered conversation
-        - mask: list[int] of same length, mask = 1 for tokens that the Assistant is expected to train on.
-        """
-        # ids, masks that we will return and a helper function to help build them up.
-        ids, mask = [], []
-        def add_tokens(token_ids, mask_val):
-            if isinstance(token_ids, int):
-                token_ids = [token_ids]
-            ids.extend(token_ids)
-            mask.extend([mask_val] * len(token_ids))
+    return ticks_per_beat, notes, tempos, time_sigs
 
-        # sometimes the first message is a system message...
-        # => just merge it with the second (user) message
-        if conversation["messages"][0]["role"] == "system":
-            # some conversation surgery is necessary here for now...
-            conversation = copy.deepcopy(conversation) # avoid mutating the original
-            messages = conversation["messages"]
-            assert messages[1]["role"] == "user", "System message must be followed by a user message"
-            messages[1]["content"] = messages[0]["content"] + "\n\n" + messages[1]["content"]
-            messages = messages[1:]
-        else:
-            messages = conversation["messages"]
-        assert len(messages) >= 1, f"Conversation has less than 1 message: {messages}"
 
-        # fetch all the special tokens we need
-        bos = self.get_bos_token_id()
-        user_start, user_end = self.encode_special("<|user_start|>"), self.encode_special("<|user_end|>")
-        assistant_start, assistant_end = self.encode_special("<|assistant_start|>"), self.encode_special("<|assistant_end|>")
-        python_start, python_end = self.encode_special("<|python_start|>"), self.encode_special("<|python_end|>")
-        output_start, output_end = self.encode_special("<|output_start|>"), self.encode_special("<|output_end|>")
+def midi_to_tokens(midi_path: str) -> List[int]:
+    """MIDI file → flat OctupleMIDI token stream. Ends with EOS_NOTE (8 EOS tokens)."""
+    try:
+        ticks_per_beat, notes, tempos, time_sigs = _parse_midi(midi_path)
+    except Exception:
+        return list(EOS_NOTE)
+    if not notes:
+        return list(EOS_NOTE)
 
-        # now we can tokenize the conversation
-        add_tokens(bos, 0)
-        for i, message in enumerate(messages):
+    def bpm_at(tick):
+        bpm = 120.0
+        for t, b in tempos:
+            if t <= tick: bpm = b
+            else: break
+        return bpm
 
-            # some sanity checking here around assumptions, to prevent footguns
-            must_be_from = "user" if i % 2 == 0 else "assistant"
-            assert message["role"] == must_be_from, f"Message {i} is from {message['role']} but should be from {must_be_from}"
+    def ts_at(tick):
+        num, den = 4, 4
+        for t, n, d in time_sigs:
+            if t <= tick: num, den = n, d
+            else: break
+        return num, den
 
-            # content can be either a simple string or a list of parts (e.g. containing tool calls)
-            content = message["content"]
+    notes.sort(key=lambda n: n[0])
+    tokens: List[int] = []
 
-            if message["role"] == "user":
-                assert isinstance(content, str), "User messages are simply expected to be strings"
-                value_ids = self.encode(content)
-                add_tokens(user_start, 0)
-                add_tokens(value_ids, 0)
-                add_tokens(user_end, 0)
-            elif message["role"] == "assistant":
-                add_tokens(assistant_start, 0)
-                if isinstance(content, str):
-                    # simple string => simply add the tokens
-                    value_ids = self.encode(content)
-                    add_tokens(value_ids, 1)
-                elif isinstance(content, list):
-                    for part in content:
-                        value_ids = self.encode(part["text"])
-                        if part["type"] == "text":
-                            # string part => simply add the tokens
-                            add_tokens(value_ids, 1)
-                        elif part["type"] == "python":
-                            # python tool call => add the tokens inside <|python_start|> and <|python_end|>
-                            add_tokens(python_start, 1)
-                            add_tokens(value_ids, 1)
-                            add_tokens(python_end, 1)
-                        elif part["type"] == "python_output":
-                            # python output => add the tokens inside <|output_start|> and <|output_end|>
-                            # none of these tokens are supervised because the tokens come from Python at test time
-                            add_tokens(output_start, 0)
-                            add_tokens(value_ids, 0)
-                            add_tokens(output_end, 0)
-                        else:
-                            raise ValueError(f"Unknown part type: {part['type']}")
-                else:
-                    raise ValueError(f"Unknown content type: {type(content)}")
-                add_tokens(assistant_end, 1)
+    for (abs_tick, pitch, vel, dur_ticks, prog, is_drum) in notes:
+        bpm      = bpm_at(abs_tick)
+        num, den = ts_at(abs_tick)
 
-        # truncate to max_tokens tokens MAX (helps prevent OOMs)
-        ids = ids[:max_tokens]
-        mask = mask[:max_tokens]
-        return ids, mask
+        ticks_per_bar  = int(ticks_per_beat * 4 * num / den)
+        bar_idx        = abs_tick // ticks_per_bar if ticks_per_bar > 0 else 0
+        pos_tick       = abs_tick  % ticks_per_bar if ticks_per_bar > 0 else 0
+        ticks_per_64th = max(1, ticks_per_beat // 16)
+        pos_64ths      = pos_tick // ticks_per_64th
 
-    def visualize_tokenization(self, ids, mask, with_token_id=False):
-        """Small helper function useful in debugging: visualize the tokenization of render_conversation"""
-        RED = '\033[91m'
-        GREEN = '\033[92m'
-        RESET = '\033[0m'
-        GRAY = '\033[90m'
-        tokens = []
-        for i, (token_id, mask_val) in enumerate(zip(ids, mask)):
-            token_str = self.decode([token_id])
-            color = GREEN if mask_val == 1 else RED
-            tokens.append(f"{color}{token_str}{RESET}")
-            if with_token_id:
-                tokens.append(f"{GRAY}({token_id}){RESET}")
-        return '|'.join(tokens)
+        us_per_tick = (60_000_000 / bpm) / ticks_per_beat
+        dur_ms      = dur_ticks * us_per_tick / 1000.0
 
-    def render_for_completion(self, conversation):
-        """
-        Used during Reinforcement Learning. In that setting, we want to
-        render the conversation priming the Assistant for a completion.
-        Unlike the Chat SFT case, we don't need to return the mask.
-        """
-        # We have some surgery to do: we need to pop the last message (of the Assistant)
-        conversation = copy.deepcopy(conversation) # avoid mutating the original
-        messages = conversation["messages"]
-        assert messages[-1]["role"] == "assistant", "Last message must be from the Assistant"
-        messages.pop() # remove the last message (of the Assistant) inplace
+        tokens += [
+            encode_time_sig(num, den),
+            encode_tempo(bpm),
+            encode_bar(bar_idx),
+            encode_position(pos_64ths),
+            encode_instrument(prog, is_drum),
+            encode_pitch(pitch),
+            encode_duration(dur_ms),
+            encode_velocity(vel),
+        ]
 
-        # Now tokenize the conversation
-        ids, mask = self.render_conversation(conversation)
+    tokens += EOS_NOTE   # 8 EOS tokens = one EOS note slot
+    return tokens
 
-        # Finally, to prime the Assistant for a completion, append the Assistant start token
-        assistant_start = self.encode_special("<|assistant_start|>")
-        ids.append(assistant_start)
-        return ids
 
-# -----------------------------------------------------------------------------
-# nanochat-specific convenience functions
+def tokens_to_midi(tokens: List[int], output_path: str,
+                   ticks_per_beat: int = 480) -> str:
+    """Flat OctupleMIDI token stream → MIDI file."""
+    # Remove trailing EOS/PAD tokens, then pad to multiple of 8
+    clean = [t for t in tokens if t != PAD_TOKEN]
+    while len(clean) % NUM_FIELDS:
+        clean.append(PAD_TOKEN)
 
-def get_tokenizer():
-    from nanochat.common import get_base_dir
-    base_dir = get_base_dir()
-    tokenizer_dir = os.path.join(base_dir, "tokenizer")
-    # return HuggingFaceTokenizer.from_directory(tokenizer_dir)
-    return RustBPETokenizer.from_directory(tokenizer_dir)
+    events = []
+    ch_map: dict = {}
 
-def get_token_bytes(device="cpu"):
-    import torch
-    from nanochat.common import get_base_dir
-    base_dir = get_base_dir()
-    tokenizer_dir = os.path.join(base_dir, "tokenizer")
-    token_bytes_path = os.path.join(tokenizer_dir, "token_bytes.pt")
-    assert os.path.exists(token_bytes_path), f"Token bytes not found at {token_bytes_path}? It gets written by tok_train.py"
-    with open(token_bytes_path, "rb") as f:
-        token_bytes = torch.load(f, map_location=device)
-    return token_bytes
+    def get_ch(prog, is_drum):
+        if is_drum: return 9
+        if prog not in ch_map:
+            used = set(ch_map.values()) | {9}
+            # ch_map[prog] = next(c for c in range(16) if c not in used)
+            ch_map[prog] = next(c for c in range(256) if c not in used)
+        return ch_map[prog]
+
+    for i in range(0, len(clean), NUM_FIELDS):
+        tup = clean[i:i+NUM_FIELDS]
+        # Skip any note whose first token is EOS or PAD
+        if tup[0] >= BASE_VOCAB:
+            continue
+
+        ts_tok, tempo_tok, bar_tok, pos_tok, inst_tok, pitch_tok, dur_tok, vel_tok = tup
+
+        num, den      = decode_time_sig(ts_tok)
+        bpm           = decode_tempo(tempo_tok)
+        bar_idx       = decode_bar(bar_tok)
+        pos_64ths     = decode_position(pos_tok)
+        prog, is_drum = decode_instrument(inst_tok)
+        pitch         = decode_pitch(pitch_tok)
+        dur_ms        = decode_duration(dur_tok)
+        vel           = decode_velocity(vel_tok)
+
+        if pitch >= 128: continue   # rest
+        vel = max(1, min(127, vel))
+
+        tempo_us       = int(60_000_000 / max(bpm, 1.0))
+        us_per_tick    = tempo_us / ticks_per_beat
+        ticks_per_bar  = int(ticks_per_beat * 4 * num / den)
+        ticks_per_64th = max(1, ticks_per_beat // 16)
+        abs_tick       = bar_idx * ticks_per_bar + pos_64ths * ticks_per_64th
+        dur_ticks      = max(1, int(dur_ms * 1000 / us_per_tick))
+        ch             = get_ch(prog, is_drum)
+
+        if not is_drum and prog not in ch_map:
+            events.append((abs_tick, bytes([0xC0 | ch, prog])))
+        events.append((abs_tick,              bytes([0x90 | ch, pitch, vel])))
+        events.append((abs_tick + dur_ticks,  bytes([0x80 | ch, pitch, 0])))
+
+    events.sort(key=lambda e: e[0])
+
+    def varlen(v):
+        buf = [v & 0x7F]; v >>= 7
+        while v: buf.append((v & 0x7F) | 0x80); v >>= 7
+        return bytes(reversed(buf))
+
+    track = bytearray(b'\x00\xFF\x51\x03' + struct.pack('>I', 500000)[1:])
+    prev = 0
+    for tick, msg in events:
+        track += varlen(max(0, tick - prev)) + msg; prev = tick
+    track += b'\x00\xFF\x2F\x00'
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, 'wb') as f:
+        f.write(struct.pack('>4sIHHH', b'MThd', 6, 0, 1, ticks_per_beat))
+        f.write(struct.pack('>4sI',    b'MTrk', len(track)))
+        f.write(track)
+    return output_path
+
+
+# ── Music generation helper ───────────────────────────────────────────────────
+
+def generate_music(engine, tokenizer, max_notes: int = 128,
+                   temperature: float = 1.0, top_k: int = 40) -> List[int]:
+    """
+    Generate a sequence of OctupleMIDI tokens using the Engine.
+
+    Because engine.generate() yields ONE token at a time and OctupleMIDI
+    needs exactly 8 tokens per note, we use the forced_tokens deque:
+    - Sample the TIME_SIG token (field 0) for each note position
+    - Force-inject fields 1-7 from the model's subsequent predictions
+    - Collect all 8 tokens per note into a flat list
+    - Stop when EOS_TOKEN is sampled or max_notes reached
+
+    This requires no changes to engine.py — we just collect the token
+    stream and group it into notes of 8 afterward.
+    """
+    # prompt = [EOS_TOKEN]   # single EOS as prompt (neutral start)
+    prompt = list(EOS_NOTE)   # single EOS as prompt (neutral start)
+    max_tokens = max_notes * NUM_FIELDS
+
+    all_tokens: List[int] = []
+    for token_column, _ in engine.generate(
+            prompt, num_samples=1,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_k=top_k):
+        tok = token_column[0]
+        all_tokens.append(tok)
+        # Stop on EOS note boundary
+        if tok == EOS_TOKEN and len(all_tokens) % NUM_FIELDS == 0:
+            break
+
+    return all_tokens
+
+
+# ── nanochat tokenizer interface ──────────────────────────────────────────────
+
+class MidiTokenizer:
+
+    def get_vocab_size(self) -> int:
+        return VOCAB_SIZE
+
+    def get_bos_token_id(self) -> int:
+        # Return a single int — engine.py passes this to the prompt list.
+        # We use EOS_TOKEN as a neutral start-of-sequence marker.
+        # return EOS_TOKEN
+        return EOS_NOTE
+
+    def encode_special(self, token_str: str) -> int:
+        # engine.py calls this for "<|assistant_end|>", "<|python_start|>", etc.
+        # All unknown special strings → EOS_TOKEN so generation terminates cleanly.
+        # return EOS_TOKEN
+        return EOS_NOTE
+
+    def encode(self, items, prepend=None, num_threads: int = 1) -> List[List[int]]:
+        bos = (self.get_bos_token_id()
+               if prepend in ("<|bos|>", EOS_TOKEN)
+               else (prepend if isinstance(prepend, int) else None))
+        out = []
+        for item in (items or []):
+            try:    toks = midi_to_tokens(str(item))
+            except: toks = list(EOS_NOTE)
+            if bos is not None:
+                toks = [bos] + toks
+            out.append(toks)
+        return out
+
+    def decode(self, tokens) -> str:
+        return f"<midi:{len(tokens)}_tokens>"
+
+    def __call__(self, item, prepend=None):
+        return self.encode([item], prepend=prepend)[0]
+
+    def __len__(self):
+        return VOCAB_SIZE
+
+
+HuggingFaceTokenizer = MidiTokenizer
+
+def get_tokenizer(base_dir=None) -> MidiTokenizer:
+    return MidiTokenizer()
+
+def get_token_bytes(tokenizer=None, device=None) -> dict:
+    return {i: 1.0 for i in range(VOCAB_SIZE)}

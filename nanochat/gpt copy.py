@@ -25,9 +25,6 @@ from nanochat.optim import MuonAdamW, DistMuonAdamW
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
 
-# OCTOPLE_FIELD_VALS = [256]*8
-OCTOPLE_FIELD_VALS = torch.tensor([256]*4)
-
 @dataclass
 class GPTConfig:
     sequence_len: int = 2048
@@ -152,108 +149,7 @@ class Block(nn.Module):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
         x = x + self.mlp(norm(x))
         return x
-    
-# class embedding_layer(nn.Module):
-#     def __init__(self,config):
-#         super().__init__()
-#         self.embed = [nn.Embedding(vals, config.n_emd) for vals in OCTOPLE_FIELD_VALS]
 
-#     def forward(self, x):
-#         # x shape: (B, T*8)
-#         assert x.size[2] % len(OCTOPLE_FIELD_VALS) == 0, "Input sequence length must be a multiple of 8 (number of fields in OctupleMIDI)"
-#         x = x.view(x.size(0), x.size(1) // len(OCTOPLE_FIELD_VALS), len(OCTOPLE_FIELD_VALS))
-
-#         # Apply embedding to each field and sum
-#         x = torch.sum(embed(x[..., i]) for i, embed in enumerate(self.embed), dim)
-#         return x
-
-# class OctupleEmbedding(nn.Module):
-#     def __init__(self, field_dims, embed_dim):
-#         super().__init__()
-#         # 1. Create offsets for each field (e.g., [0, dim0, dim0+dim1, ...])
-#         # This shifts indices so they map to a single large embedding table
-#         offsets = torch.cat([torch.tensor([0]), torch.tensor(field_dims[:-1]).cumsum(0)])
-#         self.register_buffer('offsets', offsets)
-        
-#         # 2. One single embedding layer for everything
-#         self.embedding = nn.Embedding(sum(field_dims), embed_dim)
-
-#         self.weight = self.embedding.weight
-
-#     # def __weights__(self):
-#     #     return self.embedding.weight
-
-#     def forward(self, x):
-#         # x = x.view(x.size(0), -1, len(OCTOPLE_FIELD_VALS))
-#         # print(x)
-#         # print(x.size(1)//len(OCTOPLE_FIELD_VALS))
-#         x = x.view(x.size(0), x.size(1)//len(OCTOPLE_FIELD_VALS), len(OCTOPLE_FIELD_VALS))
-
-#         # x input shape: (B, T, 8)
-        
-#         # Apply offsets: Field 0 stays same, Field 1 adds dim0, etc.
-#         # Broadcasts perfectly across (B, T, 8)
-#         x = x + self.offsets
-        
-#         # 3. Single lookup: (B, T, 8, embed_dim)
-#         embeddings = self.embedding(x)
-        
-#         # 4. Sum the 8 field embeddings into the final token representation
-#         return embeddings.sum(dim=-2) # Result: (B, T, embed_dim)
-
-
-class OctupleEmbedding(nn.Module):
-    def __init__(self, field_dims, embed_dim):
-        super().__init__()
-
-        self.nfields = len(field_dims)
-
-        # works with meta device initialization
-        # offsets = torch.cat([
-        #     torch.zeros(1, dtype=torch.long),
-        #     field_dims.cumsum(0)[:-1]
-        # ])
-        # offsets = torch.tensor([
-        #     0,256,512,768
-        # ])
-
-        # self.register_buffer("offsets", offsets)
-
-        self.embedding = nn.Embedding(sum(field_dims), embed_dim)
-
-    @property
-    def weight(self):
-        return self.embedding.weight
-
-    def forward(self, x):
-        """
-        x shape:
-            [B, T * nfields]
-        or
-            [B, T * nfields, ...]
-
-        flattened ordering:
-            [field0_t0, field1_t0, ..., fieldN_t0,
-             field0_t1, field1_t1, ...]
-        """
-
-        B = x.shape[0]
-        T = x.shape[1] // self.nfields
-
-        x = x.view(B, T, self.nfields, *x.shape[2:])
-
-
-        offsets = torch.tensor([
-            0,256,512,768
-        ]).to(x.device)
-        # broadcast offsets across batch/time
-        # x = x + self.offsets.view(1, 1, self.nfields, *([1] * (x.ndim - 3)))
-        x = x + offsets.view(1, 1, self.nfields, *([1] * (x.ndim - 3)))
-
-        embeddings = self.embedding(x)
-
-        # sum over fields
-        return embeddings.sum(dim=2)
 
 class GPT(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
@@ -269,17 +165,14 @@ class GPT(nn.Module):
         self.window_sizes = self._compute_window_sizes(config)
         # Pad vocab for efficiency (DDP, tensor cores). This is just an optimization - outputs are cropped in forward().
         # https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.resize_token_embeddings
-        # padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
-        padded_vocab_size = config.vocab_size
+        padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab_size != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
         self.transformer = nn.ModuleDict({
-            # "wte": nn.Embedding(padded_vocab_size, config.n_embd),
-            "wte": OctupleEmbedding(OCTOPLE_FIELD_VALS, config.n_embd),
+            "wte": nn.Embedding(padded_vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
-        # self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
-        self.lm_head = Linear(config.n_embd, padded_vocab_size*len(OCTOPLE_FIELD_VALS), bias=False)
+        self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
         # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
@@ -294,8 +187,7 @@ class GPT(nn.Module):
         # Value embeddings (ResFormer-style): alternating layers, last layer always included
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
-        # self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
-        self.value_embeds = nn.ModuleDict({str(i): OctupleEmbedding(OCTOPLE_FIELD_VALS, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -324,8 +216,6 @@ class GPT(nn.Module):
 
         # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.8)
-        # if isinstance(self.transformer.wte, OctupleEmbedding):
-        #     self.transformer.wte.offsets = torch.tensor([0] + OCTOPLE_FIELD_VALS[:-1]).cumsum(0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
 
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
@@ -532,8 +422,7 @@ class GPT(nn.Module):
         assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        # cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
-        cos_sin = self.cos[:, T0:T0+T//len(OCTOPLE_FIELD_VALS)], self.sin[:, T0:T0+T//len(OCTOPLE_FIELD_VALS)] # truncate cache to current sequence length
+        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
         # Embed the tokens
         x = self.transformer.wte(idx) # embed current token
@@ -578,57 +467,18 @@ class GPT(nn.Module):
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
         logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        logits = logits.view(B, T, -1)
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
 
-
-        # # tmp for testing
-        # print(logits.shape)
-        # # logits = torch.arange(len(OCTOPLE_FIELD_VALS), device=logits.device, requires_grad=True, dtype=torch.float)
-        # logits = torch.arange(OCTOPLE_FIELD_VALS[0], device=logits.device)
-        # logits = logits.repeat(B*T//OCTOPLE_FIELD_VALS[0]).view(B, T)
-        # print(logits.shape)
-        # # convert to one hot
-        # logits = (logits+88)%256
-        # tmp = logits.detach().clone()
-        # # logits = F.one_hot(logits, num_classes=self.config.vocab_size).float().requires_grad_(True)
-        # logits = F.one_hot(logits, num_classes=256).float().requires_grad_(True)*1000
-        # print(logits.shape)
-
-
         if targets is not None:
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
-            # loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)%256, ignore_index=-1, reduction=loss_reduction)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
             return loss
         else:
             # inference: just return the logits directly
-            # return logits.view(B, T//8, 8, -1)
-            return logits.view(B, T//len(OCTOPLE_FIELD_VALS), len(OCTOPLE_FIELD_VALS), -1)
-        
-        # B_l, N_l, V8 = logits.shape
-        # V = V8 // 8
-        # logits_fields = logits.view(B_l, N_l, 8, V)          # (B, N, 8, V)
-        # # Subtract field offsets so target indices are within [0, FIELD_SIZE)
-        # # field_offsets = torch.tensor([i*256 for i in range(8)],
-        # #                             device=targets.device)
-        # # targets_notes = (targets_notes - field_offsets).clamp(0, V-1)
-        # logits_fields = logits_fields.float() # switch to fp32 for logit softcap and loss computation
-        # logits_fields = softcap * torch.tanh(logits_fields / softcap) # squash the logits
-        # if targets is not None:
-        #     targets_notes = targets.view(B_l, N_l, 8)             # (B, N, 8)
-        #     loss = F.cross_entropy(
-        #         logits_fields.reshape(-1, V),
-        #         targets_notes.reshape(-1),
-        #         ignore_index=-1,
-        #         reduction=loss_reduction,
-        #     )
-        #     return loss
-        # else:
-        #     return logits_fields
+            return logits
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):

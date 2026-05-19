@@ -10,7 +10,6 @@ torchrun --nproc_per_node=8 -m scripts.base_train
 If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
 python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
 """
-
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import gc
@@ -28,7 +27,8 @@ import torch.distributed as dist
 from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
-from nanochat.tokenizer import get_tokenizer, get_token_bytes
+# from nanochat.tokenizer import get_tokenizer, get_token_bytes
+from nanochat.tokenizer_pre_update import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
@@ -47,13 +47,18 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
 # Model architecture
-parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
+# parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
+parser.add_argument("--depth", type=int, default=4, help="depth of the Transformer model")
+# parser.add_argument("--compile", type=int, default=1, help="whether to compile model")
+parser.add_argument("--compile", type=int, default=0, help="whether to compile model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
-parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
+# parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
+parser.add_argument("--max-seq-len", type=int, default=4096, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
+# parser.add_argument("--num-iterations", type=int, default=10, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
 parser.add_argument("--target-param-data-ratio", type=float, default=12, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
 # Optimization
@@ -68,8 +73,10 @@ parser.add_argument("--warmup-steps", type=int, default=40, help="number of step
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+# parser.add_argument("--resume-from-step", type=int, default=300, help="resume training from this step (-1 = disable)")
 # Evaluation
-parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
+# parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
+parser.add_argument("--eval-every", type=int, default=-1, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
@@ -243,7 +250,10 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+if args.compile:
+    # print(args.compile)
+    print(0, "Compiling the model with torch.compile() for faster training. This may take a minute...")
+    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -439,7 +449,8 @@ while True:
     # use the original uncompiled model because the inputs keep changing shape
     # disable FP8 for evaluation to use BF16 for more consistent/accurate results
     results = {}
-    if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
+    # if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
+    if False:
         model.eval()
         with disable_fp8(orig_model):
             results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
@@ -455,23 +466,96 @@ while True:
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
     if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
+    # if True:
         model.eval()
-        prompts = [
-            "The capital of France is",
-            "The chemical symbol of gold is",
-            "If yesterday was Friday, then tomorrow will be",
-            "The opposite of hot is",
-            "The planets of the solar system are:",
-            "My favorite color is",
-            "If 5*x + 3 = 13, then x is",
-        ]
-        engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
-        for prompt in prompts:
-            tokens = tokenizer(prompt, prepend="<|bos|>")
-            with disable_fp8(orig_model):
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-            print0(tokenizer.decode(sample[0]))
+        # prompts = [
+        #     "The capital of France is",
+        #     "The chemical symbol of gold is",
+        #     "If yesterday was Friday, then tomorrow will be",
+        #     "The opposite of hot is",
+        #     "The planets of the solar system are:",
+        #     "My favorite color is",
+        #     "If 5*x + 3 = 13, then x is",
+        # ]
+        # engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
+        # for prompt in prompts:
+        #     tokens = tokenizer(prompt, prepend="<|bos|>")
+        #     with disable_fp8(orig_model):
+        #         sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+        #     print0(tokenizer.decode(sample[0]))
+        # model.train()
+
+        # import os as _os
+        # from nanochat.tokenizer import tokens_to_midi
+        # _prompt = torch.zeros(1, 1, dtype=torch.long, device=device)
+        # with torch.no_grad(), disable_fp8(orig_model):
+        #     _out = orig_model.generate(_prompt, 256, temperature=1.0, top_k=40)
+        # _sample_dir = os.path.join(base_dir, "midi_samples")
+        # _os.makedirs(_sample_dir, exist_ok=True)
+        # _out_path = _os.path.join(_sample_dir, f"sample_step{step:05d}.mid")
+        # tokens_to_midi(_out[0].tolist(), _out_path)
+        # print0(f"[sample] saved {_out_path}")
+        # model.train()
+
+        # from nanochat.tokenizer import tokens_to_midi
+        # _prompt = torch.zeros(1, 1, dtype=torch.long, device=device)
+        # with torch.no_grad(), disable_fp8(orig_model):
+        #     _out = orig_model.generate(_prompt, 256, temperature=1.0, top_k=40)
+        # _sample_dir = os.path.join(base_dir, "midi_samples")
+        # os.makedirs(_sample_dir, exist_ok=True)
+        # tokens_to_midi(_out[0].tolist(), os.path.join(_sample_dir, f"sample_step{step:05d}.mid"))
+        # print0(f"[sample] saved midi_samples/sample_step{step:05d}.mid")
+
+        # model.eval()
+        # from nanochat.tokenizer import tokens_to_midi
+        # _engine = Engine(orig_model, tokenizer)
+        # _prompt = [tokenizer.get_bos_token_id()]
+        # with disable_fp8(orig_model):
+        #     _results = _engine.generate(_prompt, num_samples=1, max_tokens=256, temperature=1.0, top_k=40)
+        # _tok_list, _ = _results[0]
+        # _sample_dir = os.path.join(base_dir, "midi_samples")
+        # os.makedirs(_sample_dir, exist_ok=True)
+        # _out_path = os.path.join(_sample_dir, f"sample_step{step:05d}.mid")
+        # tokens_to_midi(_tok_list, _out_path)
+        # print0(f"[sample] saved {_out_path}  ({len(_tok_list)} tokens)")
+        # model.train()
+
+        model.eval()
+        from nanochat.tokenizer_pre_update import tokens_to_midi
+        _engine = Engine(orig_model, tokenizer)
+        # _prompt = [tokenizer.get_bos_token_id()]
+        _prompt = tokenizer.get_bos_token_id()
+        _prompt = x[0,:2048].tolist()
+        print(_prompt)
+        tokens_to_midi(_prompt, os.path.join(base_dir, "midi_samples", f"seed_step{step:05d}.mid"))
+
+        # _prompt = list(range(4*10))
+        # print(_prompt)
+        with disable_fp8(orig_model):
+            _sample, _ = _engine.generate_batch(_prompt, num_samples=1, max_tokens=256, temperature=1.0, top_k=40)
+        print(_sample)
+        _sample_dir = os.path.join(base_dir, "midi_samples")
+        os.makedirs(_sample_dir, exist_ok=True)
+        _out_path = os.path.join(_sample_dir, f"sample_step{step:05d}.mid")
+        # tokens_to_midi(_sample, _out_path)
+        tokens_to_midi(_sample[0], _out_path)
+        torch.save(_sample, os.path.join(_sample_dir, f"sample_step{step:05d}.pt"))
+        # print0(f"[sample] saved {_out_path}  ({len(_sample)} tokens)")
+        print0(f"[sample] saved {_out_path}  ({len(_sample[0])} tokens)")
         model.train()
+
+        # model.eval()
+        # from nanochat.tokenizer import tokens_to_midi, generate_music
+        # _engine = Engine(orig_model, tokenizer)
+        # with disable_fp8(orig_model):
+        #     _tok_list = generate_music(_engine, tokenizer,
+        #                             max_notes=128, temperature=1.0, top_k=40)
+        # _sample_dir = os.path.join(base_dir, "midi_samples")
+        # os.makedirs(_sample_dir, exist_ok=True)
+        # _out_path = os.path.join(_sample_dir, f"sample_step{step:05d}.mid")
+        # tokens_to_midi(_tok_list, _out_path)
+        # print0(f"[sample] saved {_out_path}  ({len(_tok_list)//8} notes)")
+        # model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
@@ -505,17 +589,20 @@ while True:
     # -------------------------------------------------------------------------
     # single training step
     # evaluate the gradient
+    # model.train()
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
+        # loss = orig_model(x,y)
         train_loss = loss.detach() # for logging
+        # print(train_loss)
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        # x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -537,6 +624,7 @@ while True:
         scaler.update()
     else:
         optimizer.step()
+    # orig_model.zero_grad(set_to_none=True) # zero the uncompiled model's grads, which are shared with the compiled model, to avoid GPU OOM from accumulating gradients
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()

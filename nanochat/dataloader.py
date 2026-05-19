@@ -18,6 +18,7 @@ https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L11
 
 import torch
 import pyarrow.parquet as pq
+import numpy as np
 
 from nanochat.common import get_dist_info
 from nanochat.dataset import list_parquet_files
@@ -48,7 +49,8 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
         pq_idx = resume_pq_idx if first_pass else 0
         while pq_idx < len(parquet_paths):
             filepath = parquet_paths[pq_idx]
-            pf = pq.ParquetFile(filepath)
+            tokens = np.fromfile(filepath, dtype=np.uint16).astype(np.int64)
+            # pf = pq.ParquetFile(filepath)
             # Start from resume point if resuming on same file, otherwise from DDP rank
             if first_pass and (resume_rg_idx is not None) and (pq_idx == resume_pq_idx):
                 base_idx = resume_rg_idx // ddp_world_size
@@ -60,12 +62,20 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
                 resume_rg_idx = None  # only do this once
             else:
                 rg_idx = ddp_rank
-            while rg_idx < pf.num_row_groups:
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], (pq_idx, rg_idx, epoch)
-                rg_idx += ddp_world_size
+            # while rg_idx < pf.num_row_groups:
+            #     rg = pf.read_row_group(rg_idx)
+            #     batch = rg.column('text').to_pylist()
+            #     for i in range(0, len(batch), tokenizer_batch_size):
+            #         yield batch[i:i+tokenizer_batch_size], (pq_idx, rg_idx, epoch)
+            #     rg_idx += ddp_world_size
+                # for i in range(0, len(tokens), tokenizer_batch_size):
+                #     yield tokens[i:i+tokenizer_batch_size], (pq_idx, rg_idx, epoch)
+
+
+            # from nanochat.tokenizer_pre_update import tokens_to_midi
+            # tokens_to_midi(tokens.tolist(), 'out.mid')
+
+            yield tokens, (pq_idx, rg_idx, epoch)
             pq_idx += 1
         first_pass = False
         epoch += 1
@@ -103,10 +113,11 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
 
     def refill_buffer():
         nonlocal pq_idx, rg_idx, epoch
-        doc_batch, (pq_idx, rg_idx, epoch) = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
-        for tokens in token_lists:
-            doc_buffer.append(tokens)
+        token_lists, (pq_idx, rg_idx, epoch) = next(batches)
+        doc_buffer.append(token_lists)
+        # token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
+        # for tokens in token_lists:
+        #     doc_buffer.append(tokens)
 
     # Pre-allocate buffers once: layout is [inputs (B*T) | targets (B*T)]
     # This gives us contiguous views and a single HtoD transfer

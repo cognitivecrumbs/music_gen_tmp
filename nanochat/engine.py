@@ -20,6 +20,8 @@ from collections import deque
 from nanochat.common import compute_init, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
 
+NUM_FIELDS = 4
+
 # -----------------------------------------------------------------------------
 # Calculator tool helpers
 @contextmanager
@@ -148,8 +150,10 @@ def sample_next_token(logits, rng, temperature=1.0, top_k=None):
         vals, idx = torch.topk(logits, k, dim=-1)
         vals = vals / temperature
         probs = F.softmax(vals, dim=-1)
-        choice = torch.multinomial(probs, num_samples=1, generator=rng)
-        return idx.gather(1, choice)
+        # choice = torch.multinomial(probs, num_samples=1, generator=rng)
+        choice = torch.multinomial(probs.view(-1, probs.size(-1)), num_samples=1, generator=rng).view(*probs.shape[:2],1)
+        # return idx.gather(1, choice)
+        return idx.gather(-1, choice)
     else:
         logits = logits / temperature
         probs = F.softmax(logits, dim=-1)
@@ -208,7 +212,8 @@ class Engine:
         )
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
         logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
-        logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
+        # logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
+        logits = logits[:, -1, :].expand(num_samples, -1, -1)  # what?
 
         # 2) Replicate the KV cache for each sample/row
         kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
@@ -228,6 +233,7 @@ class Engine:
         # 4) Main generation loop
         num_generated = 0
         while True:
+            # print(tokens)
             # Stop condition: we've reached max tokens
             if max_tokens is not None and num_generated >= max_tokens:
                 break
@@ -237,46 +243,54 @@ class Engine:
 
             # Sample the next token for each row
             next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
-            sampled_tokens = next_ids[:, 0].tolist()
+            # sampled_tokens = next_ids[:, 0].tolist()
+            sampled_tokens = next_ids[:, :, 0].tolist()
 
             # Process each row: choose the next token, update state, optional tool use
             token_column = [] # contains the next token id along each row
             token_masks = [] # contains the mask (was it sampled (1) or forced (0)?) along each row
             for i, state in enumerate(row_states):
-                # Select the next token in this row
-                is_forced = len(state.forced_tokens) > 0 # are there tokens waiting to be forced in deque?
-                token_masks.append(0 if is_forced else 1) # mask is 0 if forced, 1 if sampled
-                next_token = state.forced_tokens.popleft() if is_forced else sampled_tokens[i]
-                token_column.append(next_token)
-                # Update the state of this row to include the next token
-                state.current_tokens.append(next_token)
-                # On <|assistant_end|> or <|bos|>, mark the row as completed
-                if next_token == assistant_end or next_token == bos:
+                for j in range(NUM_FIELDS):
+                    # Select the next token in this row
+                    is_forced = len(state.forced_tokens) > 0 # are there tokens waiting to be forced in deque?
+                    token_masks.append(0 if is_forced else 1) # mask is 0 if forced, 1 if sampled
+                    next_token = state.forced_tokens.popleft() if is_forced else sampled_tokens[i][j]
+                    token_column.append(next_token)
+                    # Update the state of this row to include the next token
+                    state.current_tokens.append(next_token)
+
+                if sampled_tokens[i] == bos:
                     state.completed = True
-                # Handle tool logic
-                if next_token == python_start:
-                    state.in_python_block = True
-                    state.python_expr_tokens = []
-                elif next_token == python_end and state.in_python_block:
-                    state.in_python_block = False
-                    if state.python_expr_tokens:
-                        expr = self.tokenizer.decode(state.python_expr_tokens)
-                        result = use_calculator(expr)
-                        if result is not None:
-                            result_tokens = self.tokenizer.encode(str(result))
-                            state.forced_tokens.append(output_start)
-                            state.forced_tokens.extend(result_tokens)
-                            state.forced_tokens.append(output_end)
-                    state.python_expr_tokens = []
-                elif state.in_python_block:
-                    state.python_expr_tokens.append(next_token)
+                    continue
+                # # On <|assistant_end|> or <|bos|>, mark the row as completed
+                # # if next_token == assistant_end or next_token == bos:
+                # if next_token == assistant_end or next_token == bos:
+                #     state.completed = True
+                # # Handle tool logic
+                # if next_token == python_start:
+                #     state.in_python_block = True
+                #     state.python_expr_tokens = []
+                # elif next_token == python_end and state.in_python_block:
+                #     state.in_python_block = False
+                #     if state.python_expr_tokens:
+                #         expr = self.tokenizer.decode(state.python_expr_tokens)
+                #         result = use_calculator(expr)
+                #         if result is not None:
+                #             result_tokens = self.tokenizer.encode(str(result))
+                #             state.forced_tokens.append(output_start)
+                #             state.forced_tokens.extend(result_tokens)
+                #             state.forced_tokens.append(output_end)
+                #     state.python_expr_tokens = []
+                # elif state.in_python_block:
+                #     state.python_expr_tokens.append(next_token)
 
             # Yield the token column
             yield token_column, token_masks
             num_generated += 1
 
             # Prepare logits for next iteration
-            ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
+            # ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
+            ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(0)
             logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
 
     def generate_batch(self, tokens, num_samples=1, **kwargs):
@@ -291,13 +305,17 @@ class Engine:
         masks = [[0] * len(tokens) for _ in range(num_samples)]
         completed = [False] * num_samples
         for token_column, token_masks in self.generate(tokens, num_samples, **kwargs):
-            for i, (token, mask) in enumerate(zip(token_column, token_masks)):
+            # for i, (token, mask) in enumerate(zip(token_column, token_masks)):
+            for i in range(len(token_column)//NUM_FIELDS):
                 if not completed[i]:
-                    if token == assistant_end or token == bos:
+                    # if token == assistant_end or token == bos:
+                    if token_column[i*NUM_FIELDS:i*NUM_FIELDS+NUM_FIELDS] == bos:
                         completed[i] = True
                     else:
-                        results[i].append(token)
-                        masks[i].append(mask)
+                        for j in range(NUM_FIELDS):
+                            token, mask = token_column[i*NUM_FIELDS+j], token_masks[i*NUM_FIELDS+j]
+                            results[i].append(token)
+                            masks[i].append(mask)
             # Stop if all rows are completed
             if all(completed):
                 break
