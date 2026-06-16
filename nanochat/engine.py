@@ -179,7 +179,8 @@ class Engine:
     @torch.inference_mode()
     def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
         """Same as generate, but does single prefill and then clones the KV cache."""
-        assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
+        # assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
+        assert isinstance(tokens, list) and isinstance(tokens[0], list) and isinstance(tokens[0][0], int), "expecting list of list of ints"
         device = self.model.get_device()
         # NOTE: setting the dtype here and in this way is an ugly hack.
         # Currently the repo assumes that cuda -> bfloat16 and everything else -> float32.
@@ -250,14 +251,21 @@ class Engine:
             token_column = [] # contains the next token id along each row
             token_masks = [] # contains the mask (was it sampled (1) or forced (0)?) along each row
             for i, state in enumerate(row_states):
-                for j in range(NUM_FIELDS):
-                    # Select the next token in this row
-                    is_forced = len(state.forced_tokens) > 0 # are there tokens waiting to be forced in deque?
-                    token_masks.append(0 if is_forced else 1) # mask is 0 if forced, 1 if sampled
-                    next_token = state.forced_tokens.popleft() if is_forced else sampled_tokens[i][j]
-                    token_column.append(next_token)
-                    # Update the state of this row to include the next token
-                    state.current_tokens.append(next_token)
+                # for j in range(NUM_FIELDS):
+                #     # Select the next token in this row
+                #     is_forced = len(state.forced_tokens) > 0 # are there tokens waiting to be forced in deque?
+                #     token_masks.append(0 if is_forced else 1) # mask is 0 if forced, 1 if sampled
+                #     next_token = state.forced_tokens.popleft() if is_forced else sampled_tokens[i][j]
+                #     token_column.append(next_token)
+                #     # Update the state of this row to include the next token
+                #     state.current_tokens.append(next_token)
+                is_forced = len(state.forced_tokens) > 0 # are there tokens waiting to be forced in deque?
+                token_masks.append(0 if is_forced else 1) # mask is 0 if forced, 1 if sampled
+                next_token = state.forced_tokens.popleft() if is_forced else sampled_tokens[i]
+                token_column.append(next_token)
+                # Update the state of this row to include the next token
+                state.current_tokens.append(next_token)
+
 
                 if sampled_tokens[i] == bos:
                     state.completed = True
@@ -291,6 +299,8 @@ class Engine:
             # Prepare logits for next iteration
             # ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
             ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(0)
+            # ids = torch.cat([ids,torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(0)],1) 
+            # logits = self.model.forward(ids[:,-vocab_size:], kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
             logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
 
     def generate_batch(self, tokens, num_samples=1, **kwargs):
@@ -305,17 +315,21 @@ class Engine:
         masks = [[0] * len(tokens) for _ in range(num_samples)]
         completed = [False] * num_samples
         for token_column, token_masks in self.generate(tokens, num_samples, **kwargs):
-            # for i, (token, mask) in enumerate(zip(token_column, token_masks)):
-            for i in range(len(token_column)//NUM_FIELDS):
+            for i, (token, mask) in enumerate(zip(token_column, token_masks)):
+            # for i in range(len(token_column)//NUM_FIELDS):
+            # for j in range(len(token_column)):
                 if not completed[i]:
                     # if token == assistant_end or token == bos:
-                    if token_column[i*NUM_FIELDS:i*NUM_FIELDS+NUM_FIELDS] == bos:
+                    # if token_column[i*NUM_FIELDS:i*NUM_FIELDS+NUM_FIELDS] == bos:
+                    if token_column[i] == bos:
                         completed[i] = True
                     else:
-                        for j in range(NUM_FIELDS):
-                            token, mask = token_column[i*NUM_FIELDS+j], token_masks[i*NUM_FIELDS+j]
-                            results[i].append(token)
-                            masks[i].append(mask)
+                        # for j in range(NUM_FIELDS):
+                        #     token, mask = token_column[i*NUM_FIELDS+j], token_masks[i*NUM_FIELDS+j]
+                        #     results[i].append(token)
+                        #     masks[i].append(mask)
+                        results[i].append(token)
+                        masks[i].append(mask)
             # Stop if all rows are completed
             if all(completed):
                 break

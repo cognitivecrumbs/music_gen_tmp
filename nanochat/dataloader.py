@@ -23,6 +23,8 @@ import numpy as np
 from nanochat.common import get_dist_info
 from nanochat.dataset import list_parquet_files
 
+TOKENS_PER_TUPLE = 4
+
 def _document_batches(split, resume_state_dict, tokenizer_batch_size):
     """
     Infinite iterator over document batches (list of text strings) from parquet files.
@@ -50,6 +52,8 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
         while pq_idx < len(parquet_paths):
             filepath = parquet_paths[pq_idx]
             tokens = np.fromfile(filepath, dtype=np.uint16).astype(np.int64)
+            token_len = int(filepath.split('_')[-1].split('.')[0])
+            tokens = tokens.reshape(token_len, len(tokens) // token_len)
             # pf = pq.ParquetFile(filepath)
             # Start from resume point if resuming on same file, otherwise from DDP rank
             if first_pass and (resume_rg_idx is not None) and (pq_idx == resume_pq_idx):
@@ -122,13 +126,13 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     # Pre-allocate buffers once: layout is [inputs (B*T) | targets (B*T)]
     # This gives us contiguous views and a single HtoD transfer
     use_cuda = device == "cuda"
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long) # for building rows without creating Python lists
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda) # staging area (CPU)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device) # on-device buffer
-    cpu_inputs = cpu_buffer[:B * T].view(B, T) # a few views into these buffers just for convenience
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
+    row_buffer = torch.empty((B, row_capacity, TOKENS_PER_TUPLE), dtype=torch.long) # for building rows without creating Python lists
+    cpu_buffer = torch.empty(2 * B * T * TOKENS_PER_TUPLE, dtype=torch.long, pin_memory=use_cuda) # staging area (CPU)
+    gpu_buffer = torch.empty(2 * B * T * TOKENS_PER_TUPLE, dtype=torch.long, device=device) # on-device buffer
+    cpu_inputs = cpu_buffer[:B * T * TOKENS_PER_TUPLE].view(B, T, TOKENS_PER_TUPLE) # a few views into these buffers just for convenience
+    cpu_targets = cpu_buffer[B * T * TOKENS_PER_TUPLE:].view(B, T, TOKENS_PER_TUPLE)
+    inputs = gpu_buffer[:B * T * TOKENS_PER_TUPLE].view(B, T, TOKENS_PER_TUPLE)
+    targets = gpu_buffer[B * T * TOKENS_PER_TUPLE:].view(B, T, TOKENS_PER_TUPLE)
 
     while True:
         for row_idx in range(B):

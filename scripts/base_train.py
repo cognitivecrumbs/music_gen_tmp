@@ -53,8 +53,9 @@ parser.add_argument("--depth", type=int, default=4, help="depth of the Transform
 parser.add_argument("--compile", type=int, default=0, help="whether to compile model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
+parser.add_argument("--max-seq-len", type=int, default=512, help="max context length")
 # parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
-parser.add_argument("--max-seq-len", type=int, default=4096, help="max context length")
+# parser.add_argument("--max-seq-len", type=int, default=4096, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
@@ -525,12 +526,12 @@ while True:
         _engine = Engine(orig_model, tokenizer)
         # _prompt = [tokenizer.get_bos_token_id()]
         _prompt = tokenizer.get_bos_token_id()
-        _prompt = x[0,:2048].tolist()
+        # _prompt = x[0,:2048].tolist()
+        _prompt = x[0,:1].tolist()
         print(_prompt)
         tokens_to_midi(_prompt, os.path.join(base_dir, "midi_samples", f"seed_step{step:05d}.mid"))
 
-        # _prompt = list(range(4*10))
-        # print(_prompt)
+        # fed in one at a time
         with disable_fp8(orig_model):
             _sample, _ = _engine.generate_batch(_prompt, num_samples=1, max_tokens=256, temperature=1.0, top_k=40)
         print(_sample)
@@ -602,7 +603,7 @@ while True:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        # x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)

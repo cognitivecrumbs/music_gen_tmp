@@ -80,7 +80,9 @@ def tokenize_directory(midi_dir: str, out_dir: str = DATA_DIR, shard_size: int =
             # save as "shard"
             path = out_dir / f"shard_{i:04d}_{len(tokens):04d}.bin"
             np.array(tokens, dtype=np.uint16).tofile(str(path))
+            # print(tokens)
             tokens_so_far += len(tokens)
+            # print(np.fromfile(path, dtype=np.uint16).astype(np.int64))
 
         except Exception as e:
             skipped += 1

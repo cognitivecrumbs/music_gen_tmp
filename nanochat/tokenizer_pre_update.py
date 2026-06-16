@@ -117,7 +117,7 @@ EOS_TOKEN    = BASE_VOCAB        # 2048
 PAD_TOKEN    = BASE_VOCAB + 1    # 2049
 VOCAB_SIZE   = BASE_VOCAB + 2    # 2050
 
-EOS_TOKEN    = [255]*NUM_FIELDS
+EOS_TOKEN    = [[255]*NUM_FIELDS]
 PAD_TOKEN    = EOS_TOKEN
 VOCAB_SIZE   = FIELD_SIZE + 1
 
@@ -365,9 +365,11 @@ def midi_to_tokens(midi_path: str) -> List[int]:
         return num, denom
 
     notes.sort(key=lambda n: n[0])
-    tokens: List[int] = []
+    # tokens: List[int] = []
+    tokens_list: List[List[int]] = []
 
     for (abs_tick, pitch, vel, dur_ticks, prog, is_drum) in notes:
+        tokens: List[int] = []
         bpm      = bpm_at(abs_tick)
         num, den = time_sig_at(abs_tick)
 
@@ -411,6 +413,8 @@ def midi_to_tokens(midi_path: str) -> List[int]:
         if VELOCITY_ENCODE:
             tokens.append(encode_velocity(vel))
 
+        tokens_list.append(tokens)
+
 
 
         # indiv_token = (
@@ -432,7 +436,7 @@ def midi_to_tokens(midi_path: str) -> List[int]:
     #         pickle.dump(note_lookup, f)
 
     # tokens.append(EOS_TOKEN)
-    tokens += EOS_TOKEN
+    tokens_list += [EOS_TOKEN]
 
     # tokens_to_midi(tokens,'out.mid')
     return tokens
@@ -449,7 +453,8 @@ def tokens_to_midi(tokens: List[int], output_path: str,
     # clean = [t for t in tokens if t not in (EOS_TOKEN, PAD_TOKEN)]
     # clean = [tokens[i:i+NUM_FIELDS] for i in range(0, len(tokens), NUM_FIELDS) if tokens[i:i+NUM_FIELDS] not in (EOS_TOKEN, PAD_TOKEN)]
     # clean = [tokens[i:i+NUM_FIELDS] for i in range(0, len(tokens), NUM_FIELDS) if not np.any(np.all(tokens[i:i+NUM_FIELDS] == (EOS_TOKEN,PAD_TOKEN),1))]
-    clean = [tokens[i:i+NUM_FIELDS] for i in range(0, len(tokens), NUM_FIELDS) if tokens[i:i+NUM_FIELDS] != EOS_TOKEN or tokens[i:i+NUM_FIELDS] != PAD_TOKEN]
+    # clean = [tokens[i:i+NUM_FIELDS] for i in range(0, len(tokens), NUM_FIELDS) if tokens[i:i+NUM_FIELDS] != EOS_TOKEN or tokens[i:i+NUM_FIELDS] != PAD_TOKEN]
+    clean = [token for token in tokens if token != EOS_TOKEN and token != PAD_TOKEN]
 
     # Pad to multiple of 8
     while len(clean) % NUM_FIELDS != 0:
@@ -482,6 +487,8 @@ def tokens_to_midi(tokens: List[int], output_path: str,
     for tup in clean:
         # if any(t == 256 for t in tup):
         #     continue
+        if tup == [[255,255,255,255]]:
+            continue
         
         # default values
         num, den, bpm, bar_idx, pos_64ths, prog, pitch, dur_ms, vel = 4, 4, 110, 0, 0, 0, 0, 0, 127

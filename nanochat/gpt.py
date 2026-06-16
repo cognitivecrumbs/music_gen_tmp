@@ -237,10 +237,11 @@ class OctupleEmbedding(nn.Module):
              field0_t1, field1_t1, ...]
         """
 
-        B = x.shape[0]
-        T = x.shape[1] // self.nfields
+        # B = x.shape[0]
+        # T = x.shape[1] // self.nfields
+        B,T,W = x.shape
 
-        x = x.view(B, T, self.nfields, *x.shape[2:])
+        # x = x.view(B, T, self.nfields, *x.shape[2:])
 
 
         offsets = torch.tensor([
@@ -524,7 +525,7 @@ class GPT(nn.Module):
         return optimizer
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
-        B, T = idx.size()
+        B, T, W = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
@@ -533,7 +534,8 @@ class GPT(nn.Module):
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
         # cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
-        cos_sin = self.cos[:, T0:T0+T//len(OCTOPLE_FIELD_VALS)], self.sin[:, T0:T0+T//len(OCTOPLE_FIELD_VALS)] # truncate cache to current sequence length
+        # cos_sin = self.cos[:, T0:T0+T//len(OCTOPLE_FIELD_VALS)], self.sin[:, T0:T0+T//len(OCTOPLE_FIELD_VALS)] # truncate cache to current sequence length
+        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
         # Embed the tokens
         x = self.transformer.wte(idx) # embed current token
@@ -578,7 +580,7 @@ class GPT(nn.Module):
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
         logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        logits = logits.view(B, T, -1)
+        logits = logits.view(B, T, len(OCTOPLE_FIELD_VALS), -1)
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
@@ -607,7 +609,8 @@ class GPT(nn.Module):
         else:
             # inference: just return the logits directly
             # return logits.view(B, T//8, 8, -1)
-            return logits.view(B, T//len(OCTOPLE_FIELD_VALS), len(OCTOPLE_FIELD_VALS), -1)
+            # return logits.view(B, T//len(OCTOPLE_FIELD_VALS), len(OCTOPLE_FIELD_VALS), -1)
+            return logits
         
         # B_l, N_l, V8 = logits.shape
         # V = V8 // 8
