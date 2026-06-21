@@ -60,9 +60,9 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
                 base_idx = resume_rg_idx // ddp_world_size
                 base_idx += 1  # advance by 1 so we don't repeat data after resuming
                 rg_idx = base_idx * ddp_world_size + ddp_rank
-                if rg_idx >= pf.num_row_groups:
-                    pq_idx += 1
-                    continue
+                # if rg_idx >= pf.num_row_groups:
+                #     pq_idx += 1
+                #     continue
                 resume_rg_idx = None  # only do this once
             else:
                 rg_idx = ddp_rank

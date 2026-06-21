@@ -10,7 +10,7 @@ import torch
 
 from nanochat.common import get_base_dir
 from nanochat.gpt import GPT, GPTConfig
-from nanochat.tokenizer import get_tokenizer
+from nanochat.tokenizer_pre_update import get_tokenizer
 from nanochat.common import setup_default_logging
 
 # Set up logging

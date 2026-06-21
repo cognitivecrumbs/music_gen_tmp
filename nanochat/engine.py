@@ -311,6 +311,8 @@ class Engine:
         """
         assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
         bos = self.tokenizer.get_bos_token_id()
+        if isinstance(tokens,torch.Tensor):
+            tokens = tokens.tolist()
         results = [tokens.copy() for _ in range(num_samples)]
         masks = [[0] * len(tokens) for _ in range(num_samples)]
         completed = [False] * num_samples

@@ -47,7 +47,7 @@ import os
 from pathlib import Path
 from typing import List, Optional, Union, Tuple
 
-from nanochat.tokenizer import tokens_to_midi
+# from nanochat.tokenizer import tokens_to_midi
 
 # ── Vocabulary layout ────────────────────────────────────────────────────────
 
@@ -436,10 +436,12 @@ def midi_to_tokens(midi_path: str) -> List[int]:
     #         pickle.dump(note_lookup, f)
 
     # tokens.append(EOS_TOKEN)
-    tokens_list += [EOS_TOKEN]
+    # tokens_list += [EOS_TOKEN]
+    tokens_list += EOS_TOKEN
 
     # tokens_to_midi(tokens,'out.mid')
-    return tokens
+    # return tokens
+    return tokens_list
 
 
 def tokens_to_midi(tokens: List[int], output_path: str,
@@ -488,6 +490,14 @@ def tokens_to_midi(tokens: List[int], output_path: str,
         # if any(t == 256 for t in tup):
         #     continue
         if tup == [[255,255,255,255]]:
+            continue
+        # temporary limit
+        out_of_bounds = False
+        for val in tup:
+            if val > 255:
+                out_of_bounds = True
+                break
+        if out_of_bounds:
             continue
         
         # default values
@@ -580,29 +590,29 @@ class MidiTokenizer:
         # Return EOS_TOKEN so generation stops when model emits EOS.
         return EOS_TOKEN
 
-    def encode(self, texts_or_paths,
-               prepend: Optional[Union[int, str]] = None,
-               num_threads: int = 1) -> List[List[int]]:
-        bos = (self.get_bos_token_id()
-               if prepend in ("<|bos|>", EOS_TOKEN)
-               else (prepend if isinstance(prepend, int) else None))
-        out = []
-        for item in (texts_or_paths or []):
-            try:
-                lookup_dict = pickle.load(open(os.path.join(DEFAULT_CACHE,'note_lookup.pkl'), 'rb'))
-                toks = midi_to_tokens(str(item), lookup_dict)
-            except Exception:
-                toks = [EOS_TOKEN]
-            if bos is not None:
-                toks = [bos] + toks
-            out.append(toks)
-        return out
+    # def encode(self, texts_or_paths,
+    #            prepend: Optional[Union[int, str]] = None,
+    #            num_threads: int = 1) -> List[List[int]]:
+    #     bos = (self.get_bos_token_id()
+    #            if prepend in ("<|bos|>", EOS_TOKEN)
+    #            else (prepend if isinstance(prepend, int) else None))
+    #     out = []
+    #     for item in (texts_or_paths or []):
+    #         try:
+    #             lookup_dict = pickle.load(open(os.path.join(DEFAULT_CACHE,'note_lookup.pkl'), 'rb'))
+    #             toks = midi_to_tokens(str(item), lookup_dict)
+    #         except Exception:
+    #             toks = [EOS_TOKEN]
+    #         if bos is not None:
+    #             toks = [bos] + toks
+    #         out.append(toks)
+    #     return out
 
-    def decode(self, tokens) -> str:
-        return f"<midi:{len(tokens)}_tokens>"
+    # def decode(self, tokens) -> str:
+    #     return f"<midi:{len(tokens)}_tokens>"
 
-    def __call__(self, text_or_path, prepend=None):
-        return self.encode([text_or_path], prepend=prepend)[0]
+    # def __call__(self, text_or_path, prepend=None):
+    #     return self.encode([text_or_path], prepend=prepend)[0]
 
     def __len__(self):
         return VOCAB_SIZE

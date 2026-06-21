@@ -28,7 +28,7 @@ from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 # from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.tokenizer_pre_update import get_tokenizer, get_token_bytes
+from nanochat.tokenizer_pre_update import get_tokenizer, get_token_bytes, tokens_to_midi
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
@@ -522,7 +522,7 @@ while True:
         # model.train()
 
         model.eval()
-        from nanochat.tokenizer_pre_update import tokens_to_midi
+        # from nanochat.tokenizer_pre_update import tokens_to_midi
         _engine = Engine(orig_model, tokenizer)
         # _prompt = [tokenizer.get_bos_token_id()]
         _prompt = tokenizer.get_bos_token_id()
