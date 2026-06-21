@@ -65,8 +65,10 @@ def main():
 
     # Prompt
     if args.prompt:
-        shutil.copy(args.prompt,args.reference_out)
-        toks = midi_to_tokens(args.prompt)[:cfg.sequence_len - 1]
+        # shutil.copy(args.prompt,args.reference_out)
+        toks = midi_to_tokens(args.prompt)
+        tokens_to_midi(toks[:cfg.sequence_len+args.length], args.reference_out)
+        toks = toks[:cfg.sequence_len - 1]
         print(f"Prompt: {len(toks)} tokens from {args.prompt}")
         idx = torch.tensor(toks, dtype=torch.long, device=device)
         n_prompt = len(toks)
