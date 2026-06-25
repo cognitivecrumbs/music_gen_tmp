@@ -51,34 +51,28 @@ from typing import List, Optional, Union, Tuple
 
 # ── Vocabulary layout ────────────────────────────────────────────────────────
 
+# separate bar encoding as a header for every bar, followed by note tokens
+
+# [bar/note_identifier, bar_id, time_sig, tempo], [bar/note_identifier, bar_position, instrument, pitch, duration, velocity], ...
+
 DEFAULT_CACHE = os.path.expanduser("~/.cache/nanochat")
 
-TIME_SIG_ENCODE   = False
-TEMPO_ENCODE      = False
 BAR_ENCODE        = True
+TIME_SIG_ENCODE   = True
+TEMPO_ENCODE      = True
+
 POSITION_ENCODE   = True
 INSTRUMENT_ENCODE = False
 PITCH_ENCODE      = True
 DURATION_ENCODE   = True
-VELOCITY_ENCODE   = False
+VELOCITY_ENCODE   = True
 
 FIELD_SIZE   = 256          # tokens per field
-# NUM_FIELDS   = 8
-NUM_FIELDS   = sum([
-    TIME_SIG_ENCODE, TEMPO_ENCODE, BAR_ENCODE, POSITION_ENCODE,INSTRUMENT_ENCODE,PITCH_ENCODE,DURATION_ENCODE,VELOCITY_ENCODE])
-BASE_VOCAB   = FIELD_SIZE * NUM_FIELDS   # 2048
-
+NUM_BAR_FIELDS = sum([TIME_SIG_ENCODE, TEMPO_ENCODE, BAR_ENCODE])
+NUM_NOTE_FIELDS = sum([POSITION_ENCODE,INSTRUMENT_ENCODE,PITCH_ENCODE,DURATION_ENCODE,VELOCITY_ENCODE])
+NUM_FIELDS = max(NUM_BAR_FIELDS,NUM_NOTE_FIELDS) + 1 # for bar/note identifier
 
 # Field offsets
-F_TIME_SIG   = 0 * FIELD_SIZE
-F_TEMPO      = 1 * FIELD_SIZE
-F_BAR        = 2 * FIELD_SIZE
-F_POSITION   = 3 * FIELD_SIZE
-F_INSTRUMENT = 4 * FIELD_SIZE
-F_PITCH      = 5 * FIELD_SIZE
-F_DURATION   = 6 * FIELD_SIZE
-F_VELOCITY   = 7 * FIELD_SIZE
-
 F_TIME_SIG   = 0
 F_TEMPO      = 0
 F_BAR        = 0
@@ -88,36 +82,10 @@ F_PITCH      = 0
 F_DURATION   = 0
 F_VELOCITY   = 0
 
-# F_TIME_SIG   = 0
-# if TIME_SIG_ENCODE:
-#     F_TEMPO      = FIELD_SIZE
-# F_BAR = F_TIME_SIG
-# if TEMPO_ENCODE:
-#     F_BAR        = F_TEMPO + FIELD_SIZE
-# F_POSITION = F_BAR
-# if BAR_ENCODE:
-#     F_POSITION   = F_BAR + FIELD_SIZE
-# F_INSTRUMENT = F_POSITION
-# if POSITION_ENCODE:
-#     F_INSTRUMENT = F_POSITION + FIELD_SIZE
-# F_PITCH = F_INSTRUMENT
-# if INSTRUMENT_ENCODE:
-#     F_PITCH      = F_INSTRUMENT + FIELD_SIZE
-# F_DURATION = F_PITCH
-# if PITCH_ENCODE:
-#     F_DURATION   = F_PITCH + FIELD_SIZE
-# F_VELOCITY = F_DURATION
-# if DURATION_ENCODE:
-#     F_VELOCITY   = F_DURATION + FIELD_SIZE
+VOCAB_SIZE   = FIELD_SIZE    
 
-
-
-EOS_TOKEN    = BASE_VOCAB        # 2048
-# EOS_TOKEN    = 0        # 2048
-PAD_TOKEN    = BASE_VOCAB + 1    # 2049
-VOCAB_SIZE   = BASE_VOCAB + 2    # 2050
-
-EOS_TOKEN    = [[255]*NUM_FIELDS]
+BOS_TOKEN    = [2] + [0]*(NUM_FIELDS - 1)
+EOS_TOKEN    = [3] + [0]*(NUM_FIELDS - 1)
 PAD_TOKEN    = EOS_TOKEN
 VOCAB_SIZE   = FIELD_SIZE + 1
 
@@ -332,23 +300,14 @@ def midi_to_tokens(midi_path: str) -> List[int]:
     # return list(range(FIELD_SIZE)) * 10
     # return [0]*FIELD_SIZE * 10
     
-
     try:
         ticks_per_beat, notes, tempos, time_sigs = _parse_midi(midi_path)
     except Exception:
-        # return [EOS_TOKEN]
-        return EOS_TOKEN
+        return [BOS_TOKEN, EOS_TOKEN]
 
     if not notes:
-        # return [EOS_TOKEN]
-        return EOS_TOKEN
+        return [BOS_TOKEN, EOS_TOKEN]
  
-    # if train:
-    #     note_lookup = {}
-    #     note_lookup['EOS'] = len(note_lookup)
-    # else:
-    #     note_lookup = pickle.load(open(os.path.join(DEFAULT_CACHE,'note_lookup.pkl', 'rb')))
-
     # Build tick→bpm lookup
     def bpm_at(tick):
         bpm = 120.0
@@ -364,10 +323,11 @@ def midi_to_tokens(midi_path: str) -> List[int]:
             else: break
         return num, denom
 
-    notes.sort(key=lambda n: n[0])
+    # notes.sort(key=lambda n: n[0])
+    notes.sort(key=lambda n: n)
     # tokens: List[int] = []
     tokens_list: List[List[int]] = []
-
+    old_bar_idx = -1
     for (abs_tick, pitch, vel, dur_ticks, prog, is_drum) in notes:
         tokens: List[int] = []
         bpm      = bpm_at(abs_tick)
@@ -385,23 +345,24 @@ def midi_to_tokens(midi_path: str) -> List[int]:
         us_per_tick = (60_000_000 / bpm) / ticks_per_beat
         dur_ms = dur_ticks * us_per_tick / 1000.0
 
-        # tokens += [
-        #     encode_time_sig(num, den),
-        #     encode_tempo(bpm),
-        #     encode_bar(bar_idx),
-        #     encode_position(pos_64ths),
-        #     encode_instrument(prog, is_drum),
-        #     encode_pitch(pitch),
-        #     encode_duration(dur_ms),
-        #     encode_velocity(vel),
-        # ]
+        if old_bar_idx != bar_idx:
+            old_bar_idx = bar_idx
+            tokens.append(0)  # bar/note identifier
+            if BAR_ENCODE:
+                tokens.append(encode_bar(bar_idx))
+            if TIME_SIG_ENCODE:
+                tokens.append(encode_time_sig(num,den))
+            if TEMPO_ENCODE:
+                tokens.append(encode_tempo(bpm))
 
-        if TIME_SIG_ENCODE:
-            tokens.append(encode_time_sig(num,den))
-        if TEMPO_ENCODE:
-            tokens.append(encode_tempo(bpm))
-        if BAR_ENCODE:
-            tokens.append(encode_bar(bar_idx))
+            # append padding to make all tokens the same length
+            if len(tokens) < NUM_FIELDS:
+                tokens += [0] * (NUM_FIELDS - len(tokens))
+    
+            tokens_list.append(tokens)
+            tokens = []
+
+        tokens.append(1)  # bar/note identifier
         if POSITION_ENCODE: 
             tokens.append(encode_position(pos_64ths))
         if INSTRUMENT_ENCODE:
@@ -413,34 +374,14 @@ def midi_to_tokens(midi_path: str) -> List[int]:
         if VELOCITY_ENCODE:
             tokens.append(encode_velocity(vel))
 
+        # append padding to make all tokens the same length
+        if len(tokens) < NUM_FIELDS:
+            tokens += [0] * (NUM_FIELDS - len(tokens))
+ 
         tokens_list.append(tokens)
 
+    # tokens_list += EOS_TOKEN
 
-
-        # indiv_token = (
-        #     encode_time_sig(num, den) if TIME_SIG_ENCODE else 0,
-        #     encode_tempo(bpm) if TEMPO_ENCODE else 0,
-        #     encode_bar(bar_idx) if BAR_ENCODE else 0,
-        #     encode_position(pos_64ths) if POSITION_ENCODE else 0,
-        #     encode_instrument(prog, is_drum) if INSTRUMENT_ENCODE else 0,
-        #     encode_pitch(pitch) if PITCH_ENCODE else 0,
-        #     encode_duration(dur_ms) if DURATION_ENCODE else 0,
-        #     encode_velocity(vel) if VELOCITY_ENCODE else 0,
-        # )
-        # if indiv_token not in note_lookup:
-        #     note_lookup[(indiv_token)] = len(note_lookup)
-        # tokens += [note_lookup[indiv_token]]
-
-    # if train:
-    #     with open(os.path.join(DEFAULT_CACHE,'note_lookup.pkl'), 'wb') as f:
-    #         pickle.dump(note_lookup, f)
-
-    # tokens.append(EOS_TOKEN)
-    # tokens_list += [EOS_TOKEN]
-    tokens_list += EOS_TOKEN
-
-    # tokens_to_midi(tokens,'out.mid')
-    # return tokens
     return tokens_list
 
 
@@ -465,31 +406,12 @@ def tokens_to_midi(tokens: List[int], output_path: str,
     events = []   # (abs_tick, msg_bytes)
     program_set = set()
 
-    # for i in range(0, len(clean), NUM_FIELDS):
-    #     tup = clean[i:i+NUM_FIELDS]
-    #     if len(tup) < NUM_FIELDS:
-    #         break
-
-        # ts_tok, tempo_tok, bar_tok, pos_tok, inst_tok, pitch_tok, dur_tok, vel_tok = tup
-
-        # # Decode fields
-        # num, den       = decode_time_sig(ts_tok)
-        # bpm            = decode_tempo(tempo_tok)
-        # bar_idx        = decode_bar(bar_tok)
-        # pos_64ths      = decode_position(pos_tok)
-        # prog, is_drum  = decode_instrument(inst_tok)
-        # pitch          = decode_pitch(pitch_tok)
-        # dur_ms         = decode_duration(dur_tok)
-        # vel            = decode_velocity(vel_tok)
-
-        # if pitch == 128:   # rest token
-        #     continue
-        # vel = max(1, min(127, vel))
-
+    # default values
+    num, den, bpm, bar_idx, pos_64ths, prog, pitch, dur_ms, vel = 4, 4, 110, 0, 0, 0, 0, 0, 127
+    is_drum = False
     for tup in clean:
-        # if any(t == 256 for t in tup):
-        #     continue
-        if tup == [[255,255,255,255]]:
+        # if tup == [[255,255,255,255]]:
+        if tup == BOS_TOKEN or tup == EOS_TOKEN or tup == PAD_TOKEN:
             continue
         # temporary limit
         out_of_bounds = False
@@ -500,53 +422,52 @@ def tokens_to_midi(tokens: List[int], output_path: str,
         if out_of_bounds:
             continue
         
-        # default values
-        num, den, bpm, bar_idx, pos_64ths, prog, pitch, dur_ms, vel = 4, 4, 110, 0, 0, 0, 0, 0, 127
-        is_drum = False
-        tup_idx = 0
-        if TIME_SIG_ENCODE:
-            num, den = decode_time_sig(tup[tup_idx])
-            tup_idx += 1
-        if TEMPO_ENCODE:
-            bpm = decode_tempo(tup[tup_idx])
-            tup_idx += 1
-        if BAR_ENCODE:
-            bar_idx = decode_bar(tup[tup_idx])
-            tup_idx += 1
-        if POSITION_ENCODE:
-            pos_64ths = decode_position(tup[tup_idx])
-            tup_idx += 1
-        if INSTRUMENT_ENCODE:
-            prog, is_drum = decode_instrument(tup[tup_idx])
-            tup_idx += 1
-        if PITCH_ENCODE:
-            pitch = decode_pitch(tup[tup_idx])
-            # pitch = max(0, min(128, pitch))
-            tup_idx += 1
-        if DURATION_ENCODE:
-            dur_ms = decode_duration(tup[tup_idx])
-            tup_idx += 1
-        if VELOCITY_ENCODE:
-            vel = decode_velocity(tup[tup_idx])
-            vel = max(1, min(127, vel))
-            tup_idx += 1
+        tup_idx = 1
+        if tup[0] == 0: # bar header
+            if BAR_ENCODE:
+                bar_idx = decode_bar(tup[tup_idx])
+                tup_idx += 1
+            if TIME_SIG_ENCODE:
+                num, den = decode_time_sig(tup[tup_idx])
+                tup_idx += 1
+            if TEMPO_ENCODE:
+                bpm = decode_tempo(tup[tup_idx])
+                tup_idx += 1
+        elif tup[0] == 1: # note token
+            if POSITION_ENCODE:
+                pos_64ths = decode_position(tup[tup_idx])
+                tup_idx += 1
+            if INSTRUMENT_ENCODE:
+                prog, is_drum = decode_instrument(tup[tup_idx])
+                tup_idx += 1
+            if PITCH_ENCODE:
+                pitch = decode_pitch(tup[tup_idx])
+                # pitch = max(0, min(128, pitch))
+                tup_idx += 1
+            if DURATION_ENCODE:
+                dur_ms = decode_duration(tup[tup_idx])
+                tup_idx += 1
+            if VELOCITY_ENCODE:
+                vel = decode_velocity(tup[tup_idx])
+                vel = max(1, min(127, vel))
+                tup_idx += 1
 
-        # Convert back to ticks
-        ticks_per_bar = int(ticks_per_beat * 4 * num / den)
-        ticks_per_64th = ticks_per_beat // 16
-        abs_tick = bar_idx * ticks_per_bar + pos_64ths * ticks_per_64th
+            # Convert back to ticks
+            ticks_per_bar = int(ticks_per_beat * 4 * num / den)
+            ticks_per_64th = ticks_per_beat // 16
+            abs_tick = bar_idx * ticks_per_bar + pos_64ths * ticks_per_64th
 
-        us_per_beat  = 60_000_000 / bpm
-        us_per_tick  = us_per_beat / ticks_per_beat
-        dur_ticks    = int(dur_ms * 1000 / us_per_tick)
+            us_per_beat  = 60_000_000 / bpm
+            us_per_tick  = us_per_beat / ticks_per_beat
+            dur_ticks    = int(dur_ms * 1000 / us_per_tick)
 
-        ch = 9 if is_drum else min(prog % 9, 8)  # simple channel assignment
-        if not is_drum and prog not in program_set:
-            events.append((abs_tick, bytes([0xC0 | ch, prog])))
-            program_set.add(prog)
+            ch = 9 if is_drum else min(prog % 9, 8)  # simple channel assignment
+            if not is_drum and prog not in program_set:
+                events.append((abs_tick, bytes([0xC0 | ch, prog])))
+                program_set.add(prog)
 
-        events.append((abs_tick,           bytes([0x90 | ch, pitch, vel])))
-        events.append((abs_tick + dur_ticks, bytes([0x80 | ch, pitch, 0])))
+            events.append((abs_tick,           bytes([0x90 | ch, pitch, vel])))
+            events.append((abs_tick + dur_ticks, bytes([0x80 | ch, pitch, 0])))
 
     events.sort(key=lambda e: e[0])
 
@@ -583,7 +504,7 @@ class MidiTokenizer:
         return VOCAB_SIZE
 
     def get_bos_token_id(self) -> int:
-        return EOS_TOKEN   # no real BOS; EOS as neutral start
+        return BOS_TOKEN  
 
     def encode_special(self, token_str: str) -> int:
         # Engine.generate_batch calls this for "<|assistant_end|>".

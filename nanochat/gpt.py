@@ -26,7 +26,8 @@ from nanochat.optim import MuonAdamW, DistMuonAdamW
 from nanochat.flash_attention import flash_attn
 
 # OCTOPLE_FIELD_VALS = [256]*8
-OCTOPLE_FIELD_VALS = torch.tensor([256]*4)
+# OCTOPLE_FIELD_VALS = torch.tensor([256]*4)
+OCTOPLE_FIELD_VALS = torch.tensor([0,3] + [256]*3)
 
 @dataclass
 class GPTConfig:
@@ -217,7 +218,9 @@ class OctupleEmbedding(nn.Module):
         #     0,256,512,768
         # ])
 
-        # self.register_buffer("offsets", offsets)
+        offsets = OCTOPLE_FIELD_VALS.cumsum(0)
+
+        self.register_buffer("offsets", offsets)
 
         self.embedding = nn.Embedding(sum(field_dims), embed_dim)
 
@@ -244,12 +247,16 @@ class OctupleEmbedding(nn.Module):
         # x = x.view(B, T, self.nfields, *x.shape[2:])
 
 
-        offsets = torch.tensor([
-            0,256,512,768
-        ]).to(x.device)
+        # offsets = torch.tensor([
+        #     0,256,512,768
+        # ]).to(x.device)
+        # offsets = torch.tensor([
+        #     0,3,256+3,512+3,768+3
+        # ]).to(x.device)
+        # offsets = OCTOPLE_FIELD_VALS.cumsum(0).to(x.device)
         # broadcast offsets across batch/time
-        # x = x + self.offsets.view(1, 1, self.nfields, *([1] * (x.ndim - 3)))
-        x = x + offsets.view(1, 1, self.nfields, *([1] * (x.ndim - 3)))
+        x = x + self.offsets.view(1, 1, self.nfields, *([1] * (x.ndim - 3)))
+        # x = x + offsets.view(1, 1, self.nfields, *([1] * (x.ndim - 3)))
 
         embeddings = self.embedding(x)
 

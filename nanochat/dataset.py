@@ -21,7 +21,7 @@ import pickle
 import numpy as np
 
 # from nanochat.tokenizer import midi_to_tokens
-from nanochat.tokenizer_pre_update import midi_to_tokens
+from nanochat.tokenizer_pre_update import midi_to_tokens, tokens_to_midi
 
 DEFAULT_CACHE = os.path.expanduser("~/.cache/nanochat")
 SHARD_SIZE    = 1_000_000
@@ -68,14 +68,17 @@ def tokenize_directory(midi_dir: str, out_dir: str = DATA_DIR, shard_size: int =
 
     # lookup_dict = {}
 
-    # all_tokens: List[int] = []
+    # delete all shard files in folder
+    for f in out_dir.glob("shard_*.bin"):
+        f.unlink()
+
     skipped = 0
     tokens_so_far = 0
     for i, f in enumerate(files):
         try:
-            # all_tokens.extend(midi_to_tokens(str(f),lookup_dict))
-            # all_tokens.extend(midi_to_tokens(str(f)))
             tokens = midi_to_tokens(str(f))
+            # from nanochat.tokenizer_pre_update import tokens_to_midi
+            # tokens_to_midi(tokens, 'tmp.mid')
 
             # save as "shard"
             path = out_dir / f"shard_{i:04d}_{len(tokens):04d}.bin"
