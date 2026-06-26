@@ -119,7 +119,7 @@ if __name__ == "__main__":
 # if True:
     p = argparse.ArgumentParser()
     # p.add_argument("--midi-dir",   required=True)
-    p.add_argument("--midi-dir",   default="/Users/felix/.cache/nanochat/base_data_midi")
+    p.add_argument("--midi-dir",   default=os.path.expanduser("~/.cache/nanochat/base_data_midi"))
     p.add_argument("--out-dir",    default=DATA_DIR)
     p.add_argument("--shard-size", type=int, default=SHARD_SIZE)
     args = p.parse_args()
